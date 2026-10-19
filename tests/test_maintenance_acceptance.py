@@ -31,6 +31,7 @@ class MaintenanceAcceptance(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.clock_file = Path(self.temp.name) / "clock"
+        self.server_log = Path(self.temp.name) / "server.log"
         self.clock_file.write_text(str(time.time()))
         ReceiverHandler.events = []
         self.receiver = ThreadingHTTPServer(("127.0.0.1", 0), ReceiverHandler)
@@ -50,8 +51,9 @@ class MaintenanceAcceptance(unittest.TestCase):
         self.camera = json.loads(self.request("/api/v1/cameras", cookie=self.cookie)[2])[0]
 
     def start_app(self):
-        self.proc = subprocess.Popen([sys.executable, str(ROOT / "app.py")], env=self.env, cwd=ROOT,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with self.server_log.open("ab", buffering=0) as server_log:
+            self.proc = subprocess.Popen([sys.executable, str(ROOT / "app.py")], env=self.env, cwd=ROOT,
+                                         stdout=subprocess.DEVNULL, stderr=server_log)
         self.base = f"http://127.0.0.1:{self.port}"
         for _ in range(60):
             try:
@@ -71,10 +73,13 @@ class MaintenanceAcceptance(unittest.TestCase):
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"Content-Type":"application/json", **({"Cookie":cookie} if cookie else {}), **(headers or {})})
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with urllib.request.urlopen(req, timeout=10) as response:
                 return response.status, response.headers, response.read()
         except urllib.error.HTTPError as error:
-            return error.code, error.headers, error.read()
+            body = error.read()
+            if error.code >= 500:
+                body += b"\n" + self.server_log.read_bytes()
+            return error.code, error.headers, body
 
     def wait_for(self, check):
         for _ in range(60):

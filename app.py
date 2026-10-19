@@ -575,9 +575,9 @@ def dispatch_webhook_delivery(delivery_id):
         status = send_webhook(url, payload, secret)
         with connect_db() as db:
             db.execute("UPDATE webhook_deliveries SET state='delivered',attempt_count=attempt_count+1,updated_at=?,next_attempt_at=0,http_status=?,error_code=NULL WHERE id=?", (utc_now(), status, delivery_id))
-        delivery=db.execute("SELECT event_id FROM webhook_deliveries WHERE id=?",(delivery_id,)).fetchone()
-        if delivery and db.execute("SELECT 1 FROM webhook_deliveries WHERE event_id=? AND state!='delivered' LIMIT 1",(delivery["event_id"],)).fetchone() is None:
-            db.execute("UPDATE event_outbox SET delivery_state='delivered' WHERE event_id=?",(delivery["event_id"],))
+            delivery=db.execute("SELECT event_id FROM webhook_deliveries WHERE id=?",(delivery_id,)).fetchone()
+            if delivery and db.execute("SELECT 1 FROM webhook_deliveries WHERE event_id=? AND state!='delivered' LIMIT 1",(delivery["event_id"],)).fetchone() is None:
+                db.execute("UPDATE event_outbox SET delivery_state='delivered' WHERE event_id=?",(delivery["event_id"],))
     except Exception as error:
         code = str(error) if str(error) in ("destination_unavailable", "receiver_rejected", "receiver_unavailable") else "delivery_error"
         with connect_db() as db:
