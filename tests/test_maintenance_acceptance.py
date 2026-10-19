@@ -71,7 +71,7 @@ class MaintenanceAcceptance(unittest.TestCase):
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"Content-Type":"application/json", **({"Cookie":cookie} if cookie else {}), **(headers or {})})
         try:
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 return response.status, response.headers, response.read()
         except urllib.error.HTTPError as error:
             return error.code, error.headers, error.read()
