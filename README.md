@@ -169,4 +169,123 @@ curl -X PUT -H "Authorization: Bearer $CHM_ADMIN_TOKEN" -H 'Content-Type: applic
   http://localhost:8080/api/v1/cameras/CAMERA_ID/exclusion
 ```
 
-For planned work, create a camera- or server-scoped maintenance window with an ISO-8601 start, end, and reason. Checks continue and health evidence is persisted throughout a temporary maintenance window. Health incident webhooks are suppressed; job completion events and webhook delivery behavior are unchanged. At the end time the scheduler (or a `GET /api/v1/maintenance`) finalizes the window and evaluates the newest persisted check result. A still-current warning/failure produces one current incident event; suppressed intermediate check transitions are not replayed. A successful latest result le
+For planned work, create a camera- or server-scoped maintenance window with an ISO-8601 start, end, and reason. Checks continue and health evidence is persisted throughout a temporary maintenance window. Health incident webhooks are suppressed; job completion events and webhook delivery behavior are unchanged. At the end time the scheduler (or a `GET /api/v1/maintenance`) finalizes the window and evaluates the newest persisted check result. A still-current warning/failure produces one current incident event; suppressed intermediate check transitions are not replayed. A successful latest result leaves the issue resolved without a recovery event for a failure that was never notified.
+
+```sh
+curl -X POST -H "Authorization: Bearer $CHM_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"entity_type":"server","entity_id":"SERVER_ID","reason":"Recorder maintenance","starts_at":"2026-10-20T22:00:00Z","ends_at":"2026-10-20T23:30:00Z"}' \
+  http://localhost:8080/api/v1/maintenance
+curl -H "Authorization: Bearer $CHM_OPERATOR_TOKEN" http://localhost:8080/api/v1/maintenance
+curl -X DELETE -H "Authorization: Bearer $CHM_ADMIN_TOKEN" \
+  http://localhost:8080/api/v1/maintenance/WINDOW_ID
+```
+
+Windows ending in the past are rejected; start times may be in the past to begin maintenance immediately. End must follow start. Identical scope/start/end requests are idempotent and return the existing window; overlapping windows for the same scope return `409 maintenance_overlap`. Deleting a window ends it immediately and can be repeated; windows also expire automatically at `ends_at`. Administrators need `maintenance:write`; operators may list windows with `maintenance:read`. Exclusion writes use the same scopes. Exclusions and maintenance survive restarts. `/openapi.json` documents the request and response shapes.
+
+Branding PUT takes the complete `app_name`, `sso_button_text`, and `colors` object shown by `GET /api/v1/branding`. Each theme needs `accent`, `background`, `surface`, and `text` as `#RRGGBB` values. Optional `asset_uploads` maps `light_logo`, `dark_logo`, `favicon`, and/or `sso_logo` to base64 PNG/JPEG image data; set a value to `null` to remove it. Logos are limited to 2 MiB and 2048×2048 pixels; favicon is limited to 512 KiB and 512×512 pixels. Invalid images, including SVG, are rejected without updating the branding configuration. Image responses use fixed asset names, `X-Content-Type-Options: nosniff`, and a sandbox content policy. Images are stored in the persistent data volume.
+
+The SSO label and logo are saved and displayed as branding data. The SSO sign-in button becomes active when an administrator configures OIDC.
+
+## Network and ExacqVision prerequisites
+
+The VM needs DNS and network routes/firewall rules to each recorder and any separately configured RTSP server. No recorder API port is assumed by the form; specify a port only after confirming it for the installed interface. Exacq public material identifies CLI/SDK/Web Services Integration tools and describes Web Service as an interface for video/server data. The SDK/OEM path is gated by the Connected Partner Program. Public documentation does not establish the installed server's authentication method, exposed API operations, enabled services, permissions, platform, or licensing.
+
+Before enabling real integration, record the installed ExacqVision version, server platform and licensing, Web Service/API enablement and contract, supported authentication method, least-privilege account permissions, network paths and ports, and optional RTSP configuration. RTSP is separately configured and optional (vendor documentation describes port 8554 as its default); it is not implied by enabling Web Service. Confirm camera discovery, fresh live sample retrieval plus decoding, recording search, and newest recorded sample retrieval plus decoding independently. This configuration slice stores credentials but does not authenticate to the recorder.
+
+Until the installed contract is validated, Exacq discovery remains `untested`; manual discovery returns `501 integration_unverified` with actionable prerequisites. Live delivery, recording search, and recorded playback remain independently `untested`. Requests to start a live check on an Exacq camera return `501 integration_unverified`; no recorder request is attempted. Fixture success is not evidence of Exacq compatibility.
+
+Live checks run asynchronously and return a pollable job (`queued`, `running`, `succeeded`, `failed`, or `cancelled`). The service limits active live and recording work separately with `CHM_LIVE_CHECK_CONCURRENCY` (default 4, maximum 8), prevents overlapping check types for one camera, and bounds FFmpeg decoding with `CHM_LIVE_CHECK_TIMEOUT_SECONDS` (default 15, maximum 60). FFmpeg reads a temporary sample file that is removed after success, failure, timeout, or cancellation. A successful result confirms that FFmpeg decoded at least one video frame. `sample_timestamp` is null when the source supplies no capture timestamp; a container presentation timestamp is not treated as wall-clock capture evidence. Job outcomes are held in memory for up to 24 hours and are lost if the service restarts; persisted current health, last success, and next schedule time remain available.
+
+The monitoring scheduler checks schedules every second by default (`CHM_SCHEDULER_TICK_SECONDS`, bounded to 0.25–30 seconds) and can be disabled with `CHM_SCHEDULER_ENABLED=false`. Due work is staggered across cameras, starts only when a bounded worker slot is available, and advances its next run before dispatch. This intentionally skips a run that was missed while the service was down or a camera was busy; it does not build a catch-up queue. At startup, overdue schedules move to one future interval, so restart does not replay backlog. Active jobs are process-local: a container restart interrupts in-flight work, but does not duplicate it. Run one application instance per data volume; concurrency exclusion is process-local, not a distributed lock across multiple replicas.
+
+### Monitoring the monitor
+
+`GET /healthz` is process liveness only: HTTP 200 means the web process can answer. `GET /readyz` also checks SQLite readiness. Neither endpoint claims that camera checks are progressing. Authenticated `GET /api/v1/monitoring` and the dashboard report monitor state (`healthy`, `fault`, `starting`, or `disabled`), last scheduler progress time/age, and a sanitized error code. A live process with stale scheduler progress is reported as a monitor fault; a successful later cycle emits one `monitoring.recovered` event. Fault/recovery events use the versioned webhook outbox, persist across restart, and only emit on state transitions. Diagnostic records never include exception text, credentials, URLs, or provider response bodies.
+
+Camera authentication, permission, connector, and unsupported-interface results remain `unknown` camera health. They do not open camera incidents or trigger per-camera failure notifications; fix the recorder account or integration separately. A monitor fault describes scheduler progress, not camera condition.
+
+An administrator may configure an optional external heartbeat in **Webhooks** or with `GET/PUT /api/v1/monitoring/heartbeat`. Create an enabled webhook receiver subscribed to `monitoring.heartbeat`, select it, then choose an interval from 60 to 86,400 seconds. Heartbeats use the normal durable, signed, at-least-once delivery pipeline and report process presence/progress metadata only. The remote receiver should alarm when the expected heartbeat is missing by its own timeout; this is the way to detect a fully stopped container that cannot report its own failure. Heartbeat delivery failures are visible in the receiver's sanitized delivery history and retry with the usual backoff.
+
+For acceptance tests, `CHM_TEST_CLOCK_FILE` may point to a file containing an epoch timestamp. The scheduler reads that clock for due-time and confirmation decisions; leave this unset in normal deployments.
+
+Recording checks use the persisted server `recording_lookback_hours` default (24 hours) unless a camera override is configured (1–720 hours). The time window includes its exact lower boundary. A check searches that rolling window, selects the newest matching recording by timestamp, retrieves a small sample, and requires FFmpeg to decode a frame. `recording_status.health` is independent of live status: `healthy` means a sample decoded; `warning` with reason `no_recent_recording` means the window had no motion footage; `failure` with reason `decode_failed` means a matching newest recording existed but was unreadable; connector, unsupported, timeout, and permission problems are `unknown` and do not claim a camera fault. Results retain check time, the most recent successful recording-check time, newest recording time, and sanitized evidence without retaining media. Recording jobs are in-memory for polling and are lost on restart, while the latest per-camera outcome persists. The server-level action returns one job per present camera; poll each job ID for completion.
+
+### Incidents and recovery
+
+Live and recording findings create independent incidents, so a successful live sample never clears a recording warning and a successful recording decode never hides a live failure. `GET /api/v1/incidents` lists active incidents by default; pass `?status=resolved` or `?status=all` for resolved incidents. `GET /api/v1/incidents/{incident_id}` returns the incident, sanitized evidence, and its transition history. `POST /api/v1/incidents/{incident_id}/acknowledge` records the operator and timestamp; it does not change health, resolve the incident, or prevent recovery notifications. `GET /api/v1/history?days=90` returns resolved incidents and all active incidents for a 1–90 day range. Operators need `health:read` to inspect incidents/history and `incidents:acknowledge` to acknowledge an incident.
+
+An initial live decode failure waits for the configured second attempt after 30 seconds; only a confirmed decode failure becomes a camera incident. Explicit `no_recent_recording` findings are warnings; unreadable recording samples are failures. Authentication, permission, connector, timeout, unsupported-capability, and other unknown results do not create camera incidents or resolve existing ones. A successful applicable recheck resolves its incident automatically. If an adapter explicitly reports `server_unavailable`, `server_outage`, `server_timeout`, or `monitoring_stalled`, the monitor opens one server incident and suppresses duplicate camera notifications while retaining camera-specific evidence. After server connectivity returns, the next applicable camera recheck resolves or re-notifies based on that camera's own result. The current fixture can simulate server unavailability; it does not establish Exacq compatibility.
+
+Incidents and transitions are stored in SQLite and survive container replacement. Resolved incident history is retained for 90 days by default; active incidents and pending outbox events are not pruned. The `event_outbox` table is the durable handoff seam for webhook delivery work; each incident open/update/recovery has a stable event ID and redacted JSON payload. This incident slice records pending events; delivery and retry are handled by webhook delivery support. No video or thumbnails are stored in incidents. The browser dashboard uses these same versioned API routes for active incidents, details, acknowledgments, and 90-day history.
+
+Fixture-only recording profiles include `recording_success`, `recording_none`, `recording_invalid_media`, `recording_permission_error`, `recording_search_error`, and `recording_boundary`. They exercise the same public API and use the bundled real MP4 or intentionally malformed bytes through FFmpeg. These profiles validate app behavior only; they do not establish an Exacq search or playback contract. The installed server's recording search, authorization, and recorded-playback method remain unverified, so real Exacq recording checks return `501 integration_unverified` without contacting it until validated.
+
+### Webhooks and downstream automation
+
+Administrators can add multiple receivers from **Webhooks** or the versioned REST API (`/api/v1/webhooks`). Choose event types per destination and optionally set an HMAC signing secret. Operators can read receiver metadata and sanitized delivery history, but cannot create, edit, test, or remove destinations. A receiver secret is encrypted using the persistent data-volume key, accepted only on create/update, and never returned. The browser uses these same routes as automation clients. The API explorer and downloadable OpenAPI document include the receiver and event contracts.
+
+Version 1 event names are `incident.opened`, `incident.updated`, `incident.resolved`, `job.completed`, `monitoring.fault`, `monitoring.recovered`, and `incident.reminder`; the test action sends a synthetic `test` event. Each payload is JSON with `id` (UUID), `version` (`1`), `type`, `created_at` (UTC ISO 8601), and `data`. Incident events include incident identity, server/camera identity when known, check type, severity, state, reason, and transition timestamps. Job completion includes job ID/type, server/camera identity, terminal status, completion time, and sanitized reason. Monitor fault and recovery use the same envelope with monitoring state identity and reason. No receiver credentials, API tokens, video, or thumbnails are included.
+
+Delivery is at least once. The persistent `event_outbox` row is the event source of truth; one persistent delivery row per receiver/event pair tracks attempts. Failed HTTP requests remain pending and retry after exponential delays beginning at 2 seconds, capped at 1 hour. The event ID and exact event payload stay stable across retries and process restarts. Receivers should deduplicate using `id` (and may also use `X-CHM-Event-Id`). A successful HTTP 2xx marks delivery complete. Timeouts, 3xx/4xx/5xx responses, and network failures are retried; the history retains only a sanitized error code/status, not response bodies or secrets. Test deliveries run synchronously and report their result immediately.
+
+For signed requests, the application sends `X-CHM-Event-Id`, `X-CHM-Event-Type`, `X-CHM-Event-Version`, `X-CHM-Timestamp` (Unix seconds), and `X-CHM-Signature`. The signature is `sha256=` followed by lowercase hexadecimal HMAC-SHA256 over the exact request bytes `timestamp + "." + raw_body`, keyed by the configured UTF-8 secret. Receivers should reject timestamps more than five minutes from their current UTC clock, compare signatures in constant time, parse the body only after signature verification, and deduplicate by event ID. Example verification in Python:
+
+```python
+import hashlib, hmac, time
+
+timestamp = request.headers["X-CHM-Timestamp"]
+if abs(time.time() - int(timestamp)) > 300:
+    raise ValueError("stale webhook")
+expected = "sha256=" + hmac.new(secret.encode(), timestamp.encode() + b"." + request.body, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(expected, request.headers["X-CHM-Signature"]):
+    raise ValueError("invalid signature")
+event = json.loads(request.body)
+```
+
+Use HTTPS whenever the receiver network supports it. Since automation receivers commonly run on the same private network, RFC1918 and loopback destinations are allowed after administrator configuration. The application accepts only HTTP(S), rejects URL user-info, link-local and known cloud metadata addresses, re-resolves the configured host before sending, and does not follow redirects. Restrict outbound network access at the VM/firewall to the intended automation services for additional SSRF containment. Do not enable unresolved reminders unless desired; they default off and, when enabled, are emitted once per unresolved incident every 24 hours after the first full day.
+
+Example configuration and verification:
+
+```sh
+curl -sS -H "Authorization: Bearer $CHM_ADMIN_TOKEN" http://localhost:8080/api/v1/webhook-events
+curl -sS -X POST -H "Authorization: Bearer $CHM_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"n8n","url":"https://automation.example/webhook/camera-health","events":["incident.opened","incident.resolved","job.completed"],"signing_secret":"replace-with-a-random-secret-at-least-16-chars"}' \
+  http://localhost:8080/api/v1/webhooks
+curl -sS -X POST -H "Authorization: Bearer $CHM_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{}' http://localhost:8080/api/v1/webhooks/RECEIVER_ID/test
+curl -sS -H "Authorization: Bearer $CHM_OPERATOR_TOKEN" http://localhost:8080/api/v1/webhooks/RECEIVER_ID/deliveries
+```
+
+The test endpoint creates a synthetic signed event and does not alter camera state. Repeated failed checks update their existing incident instead of sending another opening event; recovery creates one resolution event per incident. Grant automation tokens `webhooks:read` or `webhooks:write` as needed, in addition to the corresponding role. The API never includes event bodies in delivery-history responses.
+
+For acceptance testing only, `CHM_ENABLE_FIXTURE=true` enables a controlled fixture adapter that simulates inventory and capability errors and decodes a bundled real MP4 sample using FFmpeg. The `live_slow`, `live_timeout`, and `live_flaky` profiles exercise cancellation, timeout, and a successful confirmation retry; `invalid_media` verifies that malformed bytes fail decoding. Keep fixture mode disabled in production; successful fixture checks do not test camera transport or prove recorder compatibility.
+
+## Health endpoints and troubleshooting
+
+- `GET /healthz` checks that the HTTP service responds.
+- `GET /readyz` checks that the service can access its persistent SQLite store; Docker uses this for container health.
+- `GET /api/v1/monitoring` shows whether scheduled monitoring is progressing, last progress time, current monitor fault state, and sanitized diagnostics. `/healthz` only proves that the process responds; a healthy HTTP process can still have stalled or unavailable monitoring.
+- Monitoring faults describe the monitor, scheduler, authentication, permissions, or recorder connector. They are not camera incidents. Check the last progress time and sanitized reason, then validate server credentials/permissions and each independently reported Exacq capability. An unsupported integration remains unknown; do not treat it as healthy.
+- Configure an optional heartbeat receiver under **Monitoring health** or through the admin API to have the service send periodic heartbeat events. The heartbeat uses the durable webhook queue, so delivery attempts/retries are visible in webhook history. A heartbeat cannot run while the entire container is stopped: configure the receiver or an external uptime system to alert when no heartbeat arrives within a timeout longer than the configured interval plus retry allowance.
+- If live video works but recording search or playback fails, inspect the independent capability result and sanitized server error. A quiet scene with no motion in the lookback is a warning; a found recording that cannot be decoded is a failure. Validate recording search and playback separately against the installed Exacq version and account permissions.
+- If `/readyz` fails, check the volume mount and ownership. The container runs as UID `10001` and needs write access to `/data`.
+- If first-run setup reports it is already complete, sign in or use the documented offline recovery command.
+- If the browser keeps returning to sign-in, allow same-origin cookies; set `CHM_COOKIE_SECURE=true` only when accessing through HTTPS.
+- Keep the volume when replacing containers. Removing it deletes the local administrator and all persisted settings.
+
+## Run acceptance tests
+
+The API acceptance suite launches the app as a separate process with temporary persistent storage and a controlled fixture provider:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+The real-browser acceptance flow is in `tests/test_browser_acceptance.py`. To run it, install Playwright and its Chromium browser, then run the same unittest command. It covers first-run setup, recorder configuration and unverified capability display, dashboard rendering, sign-out, and sign-in through the browser.
+
+
+## OpenID Connect provider setup and role mappings
+
+OIDC is disabled until configured by an administrator in **Single sign-on** or through `PUT /api/v1/admin/auth/oidc`. Configure the provider issuer URL, client ID and secret, claim name containing role/group values, and exact values that grant administrator or operator. Unmatched users are denied; administrator mapping takes precedence.
+
+Register `https://<public-host>/api/v1/auth/oidc/callback` with the provider and set `CHM_PUBLIC_URL` to the external HTTPS origin when TLS terminates at a reverse proxy. The app uses authorization code + PKCE and validates state, nonce, token signature, issuer, audience, and lifetime. Client secrets are encrypted at rest. Preserve `/data/.secret-key` with the database during backups. The local administrator login remains available if the provider is offline.

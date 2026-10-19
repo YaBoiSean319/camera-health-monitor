@@ -786,281 +786,117 @@ class RunningApp(unittest.TestCase):
         deadline = time.time() + 4
         while time.time() < deadline:
             status = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            row = next(item for item in status["camexcept Exception:
-                time.sleep(.1)
-        cookie = self.login()
-        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Periodic", "host": "fixture.local", "adapter": "fixture"}, cookie)
-        server_id = json.loads(body)["id"]
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            server = json.loads(self.request(f"/api/v1/servers/{server_id}", cookie=cookie)[2])
-            if server["capabilities"]["camera_discovery"]["status"] == "verified":
+            row = next(item for item in status["cameras"] if item["camera_id"] == camera["id"])
+            next_due = datetime.fromisoformat(row["next_due_at"]["live"].replace("Z", "+00:00")).timestamp()
+            if next_due > downtime_clock:
                 break
             time.sleep(.1)
-        self.assertEqual("verified", server["capabilities"]["camera_discovery"]["status"])
-        self.assertEqual(1, len(json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])))
+        self.assertGreater(next_due, downtime_clock)
+        self.assertIsNone(row["active_job_id"])
 
-    def test_live_check_decodes_sample_and_exposes_pollable_result(self):
+    def test_recording_check_reports_no_recent_motion_as_warning_and_persists_separately(self):
         cookie = self.login()
         _, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Fixture recorder", "host": "fixture.local", "adapter": "fixture"
+            "name": "Quiet fixture", "host": "quiet.local", "adapter": "fixture", "fixture_profile": "recording_none"
         }, cookie)
         server_id = json.loads(body)["id"]
         self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
         camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
-
-        _, _, limited_body = self.request("/api/v1/admin/api-tokens", "POST", {
-            "name": "read-only automation", "role": "operator", "scopes": ["health:read"],
-        }, cookie)
-        limited_token = json.loads(limited_body)["token"]
-        self.assertEqual(403, self.request(f"/api/v1/cameras/{camera['id']}/live-check", "POST", {},
-                                            headers={"Authorization": f"Bearer {limited_token}"})[0])
-        _, _, runner_body = self.request("/api/v1/admin/api-tokens", "POST", {
-            "name": "live check automation", "role": "operator", "scopes": ["checks:run", "health:read"],
-        }, cookie)
-        runner_token = json.loads(runner_body)["token"]
-        bearer = {"Authorization": f"Bearer {runner_token}"}
-        status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/live-check", "POST", {}, headers=bearer)
-        self.assertEqual(202, status)
-        job_id = json.loads(body)["id"]
-        self.assertIn(json.loads(body)["status"], ("queued", "running"))
-        result = None
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            status, _, body = self.request(f"/api/v1/live-checks/{job_id}", headers=bearer)
-            self.assertEqual(200, status)
-            result = json.loads(body)
-            if result["status"] in ("succeeded", "failed", "cancelled", "unsupported"):
-                break
-            time.sleep(.05)
-        self.assertEqual("succeeded", result["status"])
-        self.assertTrue(result["result"]["decoded"])
-        self.assertGreaterEqual(result["result"]["frames_decoded"], 1)
-        self.assertIn("sample_timestamp", result["result"])
-        self.assertEqual("0.000000", result["result"]["frame_timestamp"])
-        self.assertIsNone(result["error"])
-        self.assertEqual([], list(Path(self.temp.name).glob("chm-live-*")))
-        audit = json.loads(self.request("/api/v1/admin/audit", cookie=cookie)[2])
-        check_audit = next(event for event in audit if event["action"] == "live_check.started")
-        self.assertEqual("api_token", check_audit["actor_type"])
-        self.assertEqual("live check automation", check_audit["actor_name"])
-
-        self.assertEqual(401, self.request(f"/api/v1/live-checks/{job_id}")[0])
-
-    def test_live_check_invalid_media_fails_decode_and_exacq_stays_unverified(self):
-        cookie = self.login()
-        _, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Fixture recorder", "host": "fixture.local", "adapter": "fixture", "fixture_profile": "invalid_media"
-        }, cookie)
-        fixture_id = json.loads(body)["id"]
-        self.request(f"/api/v1/servers/{fixture_id}/discover", "POST", {}, cookie)
-        camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
-        status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/live-check", "POST", {}, cookie)
-        self.assertEqual(202, status)
-        job_id = json.loads(body)["id"]
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            result = json.loads(self.request(f"/api/v1/live-checks/{job_id}", cookie=cookie)[2])
-            if result["status"] in ("succeeded", "failed", "cancelled", "unsupported"):
-                break
-            time.sleep(.05)
-        self.assertEqual("failed", result["status"])
-        self.assertEqual("decode_failed", result["error"]["code"])
-        self.assertEqual([], list(Path(self.temp.name).glob("chm-live-*")))
-
-        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Real", "host": "nvr.local"}, cookie)
-        exacq_id = json.loads(body)["id"]
-        self.assertEqual(501, self.request(f"/api/v1/servers/{exacq_id}/discover", "POST", {}, cookie)[0])
-        self.assertFalse(any(camera["server_id"] == exacq_id for camera in json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])))
-
-    def test_live_check_prevents_overlap_and_can_be_cancelled(self):
-        cookie = self.login()
-        _, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Slow fixture", "host": "fixture.local", "adapter": "fixture", "fixture_profile": "live_slow"
-        }, cookie)
-        server_id = json.loads(body)["id"]
-        self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
-        camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
-        status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/live-check", "POST", {}, cookie)
-        self.assertEqual(202, status)
-        job_id = json.loads(body)["id"]
-        status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/live-check", "POST", {}, cookie)
-        self.assertEqual(409, status)
-        self.assertEqual(job_id, json.loads(body)["job_id"])
         status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/recording-check", "POST", {}, cookie)
-        self.assertEqual(409, status)
-        self.assertEqual(job_id, json.loads(body)["job_id"])
-        self.assertEqual(202, self.request(f"/api/v1/live-checks/{job_id}", "DELETE", cookie=cookie)[0])
-        deadline = time.time() + 4
+        self.assertEqual(202, status)
+        job_id = json.loads(body)["id"]
+        deadline = time.time() + 8
         while time.time() < deadline:
-            job = json.loads(self.request(f"/api/v1/live-checks/{job_id}", cookie=cookie)[2])
-            if job["status"] == "cancelled":
+            result = json.loads(self.request(f"/api/v1/recording-checks/{job_id}", cookie=cookie)[2])
+            if result["status"] in ("completed", "failed"):
                 break
             time.sleep(.05)
-        self.assertEqual("cancelled", job["status"])
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("warning", result["result"]["health"])
+        self.assertEqual("no_recent_recording", result["result"]["reason"])
+        updated = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
+        self.assertEqual("warning", updated["recording_status"]["health"])
+        self.assertIsNone(updated["recording_status"]["newest_recording_at"])
+        self.assertEqual("unknown", updated["live_status"]["health"])
 
-    def test_monitoring_api_exposes_persistent_intervals_and_separate_current_success(self):
-        self.assertEqual(401, self.request("/api/v1/monitoring")[0])
+    def test_recording_check_decodes_newest_in_window_and_reports_bad_media_and_permissions(self):
         cookie = self.login()
-        _, _, token_body = self.request("/api/v1/admin/api-tokens", "POST", {
-            "name": "history only", "role": "operator", "scopes": ["history:read"],
-        }, cookie)
-        token = json.loads(token_body)["token"]
-        self.assertEqual(403, self.request("/api/v1/monitoring", headers={"Authorization": f"Bearer {token}"})[0])
+        for profile, expected, reason in (("recording_success", "healthy", None), ("recording_invalid_media", "failure", "decode_failed"), ("recording_permission_error", "unknown", "permission_denied")):
+            _, _, body = self.request("/api/v1/servers", "POST", {
+                "name": profile, "host": f"{profile}.local", "adapter": "fixture", "fixture_profile": profile
+            }, cookie)
+            server_id = json.loads(body)["id"]
+            self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
+            camera = next(c for c in json.loads(self.request("/api/v1/cameras", cookie=cookie)[2]) if c["server_id"] == server_id)
+            status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/recording-check", "POST", {}, cookie)
+            self.assertEqual(202, status)
+            job_id = json.loads(body)["id"]
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                result = json.loads(self.request(f"/api/v1/recording-checks/{job_id}", cookie=cookie)[2])
+                if result["status"] in ("completed", "failed"):
+                    break
+                time.sleep(.05)
+            self.assertEqual("completed", result["status"])
+            self.assertEqual(expected, result["result"]["health"])
+            if expected == "healthy":
+                self.assertIsNotNone(result["result"]["newest_recording_at"])
+                self.assertTrue(result["result"]["decoded"])
+                self.assertEqual("recording-newest.mp4", result["result"]["evidence"]["sample_name"])
+            if reason:
+                self.assertEqual(reason, result["result"]["reason"])
+        self.assertEqual([], list(Path(self.temp.name).glob("chm-recording-*")))
+
+    def test_recording_lookback_is_independently_validated_and_real_exacq_remains_unknown(self):
+        cookie = self.login()
+        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Real", "host": "nvr.local"}, cookie)
+        server_id = json.loads(body)["id"]
+        self.assertEqual(501, self.request(f"/api/v1/servers/{server_id}/recording-check", "POST", {}, cookie)[0])
+        self.assertEqual(400, self.request(f"/api/v1/cameras/not-real", "PUT", {"overrides": {"recording_lookback_hours": 0}}, cookie)[0])
+
+    def test_recording_window_includes_exact_boundary_and_camera_override_changes_window(self):
+        cookie = self.login()
         _, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Scheduled fixture", "host": "scheduled.local", "adapter": "fixture",
-            "defaults": {"live_interval_minutes": 5, "recording_interval_minutes": 60, "recording_lookback_hours": 24},
+            "name": "Boundary fixture", "host": "boundary.local", "adapter": "fixture",
+            "fixture_profile": "recording_boundary", "defaults": {"recording_lookback_hours": 12}
         }, cookie)
         server_id = json.loads(body)["id"]
         self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
         camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
-        status, _, updated = self.request(f"/api/v1/cameras/{camera['id']}", "PUT", {
-            "overrides": {"live_interval_minutes": 2, "recording_interval_minutes": 15},
-        }, cookie)
-        self.assertEqual(200, status)
-        self.assertEqual(2, json.loads(updated)["settings"]["live_interval_minutes"])
-        status, _, monitoring = self.request("/api/v1/monitoring", cookie=cookie)
-        self.assertEqual(200, status)
-        details = json.loads(monitoring)
-        self.assertIn(camera["id"], {row["camera_id"] for row in details["cameras"]})
-        camera_status = next(row for row in details["cameras"] if row["camera_id"] == camera["id"])
-        self.assertEqual(120, camera_status["intervals_seconds"]["live"])
-        self.assertEqual(900, camera_status["intervals_seconds"]["recording"])
-        self.assertIn("last_success_at", camera_status["live"])
-        self.assertIn("current_health", camera_status["live"])
-
-    def test_scheduled_live_failure_waits_for_clock_driven_confirmation(self):
-        cookie = self.login()
-        _, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Scheduled failing fixture", "host": "scheduled-failure.local", "adapter": "fixture",
-            "fixture_profile": "success",
-            "defaults": {"live_interval_minutes": 1, "recording_interval_minutes": 60, "recording_lookback_hours": 24},
-        }, cookie)
-        server_id = json.loads(body)["id"]
-        self.assertEqual(200, self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)[0])
-        camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
-        status, _, manual = self.request(f"/api/v1/cameras/{camera['id']}/live-check", "POST", {}, cookie)
+        self.assertEqual(12, camera["settings"]["recording_lookback_hours"])
+        self.assertEqual(200, self.request(f"/api/v1/cameras/{camera['id']}", "PUT", {"overrides": {"recording_lookback_hours": 6}}, cookie)[0])
+        status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/recording-check", "POST", {}, cookie)
         self.assertEqual(202, status)
-        manual_id = json.loads(manual)["id"]
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            manual_status = json.loads(self.request(f"/api/v1/live-checks/{manual_id}", cookie=cookie)[2])
-            if manual_status["status"] == "succeeded":
-                break
-            time.sleep(.1)
-        self.assertEqual("succeeded", manual_status["status"])
-        self.request(f"/api/v1/servers/{server_id}", "PUT", {"fixture_profile": "invalid_media"}, cookie)
-        # Let the autonomous scheduler reach the next due time. No page remains open.
-        deadline = time.time() + 3
-        scheduled = None
-        while time.time() < deadline:
-            before = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            scheduled = next(row for row in before["cameras"] if row["camera_id"] == camera["id"])
-            if scheduled["next_due_at"]["live"]:
-                break
-            time.sleep(.1)
-        due_epoch = datetime.fromisoformat(scheduled["next_due_at"]["live"].replace("Z", "+00:00")).timestamp()
-        self.set_clock(due_epoch + 1)
-        pending = None
+        job_id = json.loads(body)["id"]
         deadline = time.time() + 8
         while time.time() < deadline:
-            status = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            pending = next(row for row in status["cameras"] if row["camera_id"] == camera["id"])
-            if pending["live"]["state"] == "pending_confirmation":
-                break
-            time.sleep(.1)
-        self.assertEqual("pending_confirmation", pending["live"]["state"])
-        self.assertEqual("unknown", pending["live"]["current_health"])
-        self.assertIsNotNone(pending["live"]["last_success_at"])
-        self.advance_clock(31)
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            status = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            current = next(row for row in status["cameras"] if row["camera_id"] == camera["id"])
-            if current["live"]["state"] == "failure":
-                break
-            time.sleep(.1)
-        self.assertEqual("failure", current["live"]["state"])
+            result = json.loads(self.request(f"/api/v1/recording-checks/{job_id}", cookie=cookie)[2])
+            if result["status"] == "completed": break
+            time.sleep(.05)
+        self.assertEqual(6, result["lookback_hours"])
+        self.assertEqual("healthy", result["result"]["health"])
+        self.assertEqual("recording-window-boundary.mp4", result["result"]["evidence"]["sample_name"])
 
-    def test_scheduled_live_confirmation_success_recovers_and_timeout_is_reported(self):
+    def test_server_recording_job_starts_jobs_for_present_cameras_and_docs_describe_api(self):
         cookie = self.login()
-        _, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Flaky fixture", "host": "flaky.local", "adapter": "fixture", "fixture_profile": "live_flaky",
-            "defaults": {"live_interval_minutes": 1, "recording_interval_minutes": 60, "recording_lookback_hours": 24},
-        }, cookie)
+        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Server fixture", "host": "server.local", "adapter": "fixture"}, cookie)
         server_id = json.loads(body)["id"]
         self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
-        camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            schedule = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            row = next(item for item in schedule["cameras"] if item["camera_id"] == camera["id"])
-            if row["next_due_at"]["live"]:
-                break
-            time.sleep(.1)
-        self.set_clock(datetime.fromisoformat(row["next_due_at"]["live"].replace("Z", "+00:00")).timestamp() + 1)
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            status = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            current = next(item for item in status["cameras"] if item["camera_id"] == camera["id"])
-            if current["live"]["state"] == "pending_confirmation":
-                break
-            time.sleep(.1)
-        self.assertEqual("pending_confirmation", current["live"]["state"])
-        self.advance_clock(31)
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            status = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            current = next(item for item in status["cameras"] if item["camera_id"] == camera["id"])
-            if current["live"]["state"] == "healthy":
-                break
-            time.sleep(.1)
-        self.assertEqual("healthy", current["live"]["state"])
-        self.assertIsNotNone(current["live"]["last_success_at"])
-
-        _, _, timeout_body = self.request("/api/v1/servers", "POST", {
-            "name": "Timeout fixture", "host": "timeout.local", "adapter": "fixture", "fixture_profile": "live_timeout",
-        }, cookie)
-        timeout_server = json.loads(timeout_body)["id"]
-        self.request(f"/api/v1/servers/{timeout_server}/discover", "POST", {}, cookie)
-        timeout_camera = next(item for item in json.loads(self.request("/api/v1/cameras", cookie=cookie)[2]) if item["server_id"] == timeout_server)
-        status, _, job_body = self.request(f"/api/v1/cameras/{timeout_camera['id']}/live-check", "POST", {}, cookie)
+        status, _, body = self.request(f"/api/v1/servers/{server_id}/recording-check", "POST", {}, cookie)
         self.assertEqual(202, status)
-        job_id = json.loads(job_body)["id"]
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            job = json.loads(self.request(f"/api/v1/live-checks/{job_id}", cookie=cookie)[2])
-            if job["status"] in ("failed", "succeeded", "cancelled"):
-                break
-            time.sleep(.1)
-        self.assertEqual("timeout", job["error"]["code"])
+        batch = json.loads(body)
+        self.assertEqual(server_id, batch["server_id"])
+        self.assertEqual(1, len(batch["jobs"]))
+        spec = json.loads(self.request("/openapi.json")[2])
+        self.assertIn("/cameras/{camera_id}/recording-check", spec["paths"])
+        self.assertIn("/servers/{server_id}/recording-check", spec["paths"])
 
-    def test_restart_skips_missed_monitoring_runs_and_keeps_the_next_schedule(self):
-        cookie = self.login()
-        _, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Restart fixture", "host": "restart.local", "adapter": "fixture",
-            "defaults": {"live_interval_minutes": 5, "recording_interval_minutes": 60, "recording_lookback_hours": 24},
-        }, cookie)
-        server_id = json.loads(body)["id"]
-        self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
-        camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
-        status = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-        row = next(item for item in status["cameras"] if item["camera_id"] == camera["id"])
-        self.assertIsNotNone(row["next_due_at"]["live"])
-        downtime_clock = float(self.clock_file.read_text()) + 24 * 3600
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        self.set_clock(downtime_clock)
-        self.proc = subprocess.Popen([sys.executable, str(ROOT / "app.py")], env=self.env, cwd=ROOT,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(50):
-            try:
-                self.request("/api/v1/setup/status")
-                break
-            except Exception:
-                time.sleep(.1)
-        cookie = self.login()
-        deadline = time.time() + 4
-        while time.time() < deadline:
-            status = json.loads(self.request("/api/v1/monitoring", cookie=cookie)[2])
-            row = next(item for item in status["came
+    def test_live_check_openapi_contract_and_authorization(self):
+        contract = json.loads(self.request("/openapi.json")[2])
+        self.assertIn("/cameras/{camera_id}/live-check", contract["paths"])
+        self.assertIn("/live-checks/{job_id}", contract["paths"])
+        self.assertEqual(401, self.request("/api/v1/live-checks/nope")[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
