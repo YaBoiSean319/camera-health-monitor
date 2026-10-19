@@ -1,0 +1,33 @@
+services:
+  camera-health-monitor:
+    build: .
+    image: camera-health-monitor:local
+    container_name: camera-health-monitor
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cpus: 2.0
+    mem_limit: 1g
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "8080:8080"
+    environment:
+      CHM_COOKIE_SECURE: "false" # Set true when HTTPS terminates at a reverse proxy.
+      CHM_PUBLIC_URL: "" # Set to the external HTTPS origin when enabling OIDC behind a proxy.
+    volumes:
+      - camera-health-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  camera-health-data:
