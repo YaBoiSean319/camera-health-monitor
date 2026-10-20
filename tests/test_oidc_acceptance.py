@@ -17,6 +17,14 @@ from cryptography.hazmat.primitives import serialization
 
 ROOT = Path(__file__).resolve().parents[1]
 
+def chromium_available():
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).is_file()
+    except Exception:
+        return False
+
 
 class ProviderHandler(BaseHTTPRequestHandler):
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -261,7 +269,7 @@ class OIDCAcceptance(unittest.TestCase):
         callback = args["redirect_uri"][0] + "?code=controlled-code&state=" + args["state"][0]
         self.assertEqual(400, self.request(urlparse(callback).path + "?" + urlparse(callback).query)[0])
 
-    @unittest.skipUnless(__import__("importlib").util.find_spec("playwright"), "Install Playwright and Chromium for browser acceptance")
+    @unittest.skipUnless(chromium_available(), "Install Playwright and Chromium for browser acceptance")
     def test_browser_exposes_admin_mapping_and_sso_sign_in(self):
         from playwright.sync_api import sync_playwright
         with sync_playwright() as playwright:
@@ -281,7 +289,7 @@ class OIDCAcceptance(unittest.TestCase):
             form.locator('[name="operator_values"]').fill("camera-ops")
             page.get_by_role("button", name="Save single sign-on").click()
             page.get_by_role("button", name="Sign out").click()
-            page.get_by_role("link", name="Sign in with single sign-on").click()
+            page.get_by_role("button", name="Sign in with single sign-on").click()
             page.get_by_text("operator@example.test · operator").wait_for()
             self.assertFalse(page.get_by_role("button", name="Single sign-on").count())
             browser.close()
