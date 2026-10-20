@@ -2133,6 +2133,41 @@ def app(environ, start_response):
             with connect_db() as db:
                 rows = db.execute("SELECT * FROM cameras ORDER BY server_id, remote_id").fetchall()
             return response(start_response, 200, [camera_public(row) for row in rows])
+        if route.startswith("cameras/") and route.endswith("/live-feed") and method == "GET":
+            camera_id = route.split("/")[1]
+            with connect_db() as db:
+                row = db.execute("SELECT c.*,s.enabled AS server_enabled,s.adapter,s.fixture_profile,s.host,s.web_scheme,s.web_port,s.username,s.password_ciphertext FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.id=?", (camera_id,)).fetchone()
+            if not row:
+                return response(start_response, 404, {"error": "camera_not_found"})
+            camera = dict(row)
+            if not camera["server_enabled"] or camera["disappeared"] or camera["disabled"]:
+                return response(start_response, 409, {"error": "camera_unavailable"})
+            if camera["adapter"] != "exacq":
+                return response(start_response, 503, {"error": "live_feed_unavailable"})
+            password = credential_cipher().decrypt(camera["password_ciphertext"].encode()).decode() if camera["password_ciphertext"] else ""
+            server = {key: camera[key] for key in ("host", "web_scheme", "web_port")}
+            client = exacq.ExacqClient(server, camera["username"], password, timeout=LIVE_CHECK_TIMEOUT)
+            stream_id = str(uuid.uuid4())
+            try:
+                first_frame = client.live_frame(camera["remote_id"], stream_id)
+            except exacq.ExacqError as error:
+                return response(start_response, 503, {"error": "live_feed_unavailable", "reason": error.code})
+
+            boundary = b"chmframe"
+            def live_feed():
+                frame = first_frame
+                try:
+                    while True:
+                        yield b"--" + boundary + b"\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+                        time.sleep(0.4)
+                        frame = client.live_frame(camera["remote_id"], stream_id)
+                except (exacq.ExacqError, GeneratorExit):
+                    return
+
+            start_response("200 OK", [("Content-Type", "multipart/x-mixed-replace; boundary=chmframe"),
+                                       ("Cache-Control", "no-store, no-cache, must-revalidate"),
+                                       ("X-Content-Type-Options", "nosniff")])
+            return live_feed()
         if route.startswith("cameras/") and route.endswith("/live-check") and method == "POST":
             camera_id = route.split("/")[1]
             with connect_db() as db:

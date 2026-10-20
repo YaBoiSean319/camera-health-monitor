@@ -43,7 +43,7 @@ class ExacqHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlsplit(self.path)
-        query = parse_qs(parsed.query)
+        query = parse_qs(parsed.query.replace(";", "&"))
         self.requests_seen.append(("GET", parsed.path, query))
         if parsed.path == "/config.web":
             return self.send_json({"success": True, "Cameras": [
@@ -135,6 +135,17 @@ class ExacqClientTests(unittest.TestCase):
         self.assertEqual(3, result["frames_decoded"])
         self.assertFalse(result["freshness_verified"])
         self.assertIsNone(result["sample_timestamp"])
+
+    def test_live_feed_frame_uses_authenticated_camera_stream(self):
+        client = self.client()
+        frame = client.live_frame("101", "browser-stream")
+        self.assertTrue(frame.startswith(b"\xff\xd8"))
+        method, path, query = next(item for item in ExacqHandler.requests_seen if item[0] == "GET" and item[1] == "/video.web")
+        self.assertEqual("101", query["camera"][0])
+        self.assertEqual("browser-stream", query["stream"][0])
+        self.assertEqual("synthetic-session", query["s"][0])
+        self.assertEqual("1280", query["w"][0])
+        self.assertEqual("720", query["h"][0])
 
     def test_recording_search_selects_newest_clip_and_decodes_playback_frame(self):
         result = self.client().check_recording("101", 24)

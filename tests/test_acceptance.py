@@ -527,6 +527,19 @@ class RunningApp(unittest.TestCase):
         self.assertEqual("verified", server["capabilities"]["camera_discovery"]["status"])
         self.assertEqual(1, len(json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])))
 
+    def test_live_feed_requires_camera_access_and_reports_unavailable_fixture(self):
+        cookie = self.login()
+        _, _, body = self.request("/api/v1/servers", "POST", {
+            "name": "Live feed fixture", "host": "live-feed.local", "adapter": "fixture",
+        }, cookie)
+        server_id = json.loads(body)["id"]
+        self.assertEqual(200, self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)[0])
+        camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
+        self.assertEqual(401, self.request(f"/api/v1/cameras/{camera['id']}/live-feed")[0])
+        status, _, response_body = self.request(f"/api/v1/cameras/{camera['id']}/live-feed", cookie=cookie)
+        self.assertEqual(503, status)
+        self.assertEqual("live_feed_unavailable", json.loads(response_body)["error"])
+
     def test_live_check_decodes_sample_and_exposes_pollable_result(self):
         cookie = self.login()
         _, _, body = self.request("/api/v1/servers", "POST", {
