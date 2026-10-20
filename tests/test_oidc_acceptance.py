@@ -279,6 +279,7 @@ class OIDCAcceptance(unittest.TestCase):
             page.get_by_label("Username").fill("siteadmin")
             page.get_by_label("Password").fill("A-secure-password-2026")
             page.get_by_role("button", name="Sign in").click()
+            page.get_by_role("button", name="Settings").click()
             page.get_by_role("button", name="Single sign-on").click()
             form = page.locator("#oidc-form")
             form.locator('[name="enabled"]').check()
@@ -291,6 +292,8 @@ class OIDCAcceptance(unittest.TestCase):
             page.get_by_role("button", name="Sign out").click()
             page.get_by_role("button", name="Sign in with single sign-on").click()
             page.get_by_text("operator@example.test · operator").wait_for()
+            page.get_by_role("button", name="Settings").click()
+            self.assertTrue(page.get_by_label("Theme preference").is_visible())
             self.assertFalse(page.get_by_role("button", name="Single sign-on").count())
             browser.close()
 

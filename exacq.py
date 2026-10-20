@@ -25,10 +25,11 @@ MAX_SEARCH_WAIT_SECONDS = 15
 
 
 class ExacqError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, search_verified: bool = False):
         super().__init__(message)
         self.code = code
         self.safe_message = message
+        self.search_verified = search_verified
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -281,7 +282,8 @@ class ExacqClient:
         clips = self._clips(result)
         if not clips and int(result.get("frames", 0) or 0) == 0:
             return {"health": "warning", "reason": "no_recent_recording", "newest_recording_at": None,
-                    "decoded": False, "duration_ms": round((time.monotonic() - started) * 1000),
+                    "decoded": False, "search_verified": True, "playback_verified": False,
+                    "duration_ms": round((time.monotonic() - started) * 1000),
                     "evidence": {"frame_count": 0, "lookback_hours": int(lookback_hours)}}
         def clip_end(clip):
             value = clip.get("endTime") or clip.get("startTime")
@@ -308,19 +310,44 @@ class ExacqClient:
         search_id = sample.get("search_id")
         if not isinstance(search_id, str) or not search_id:
             raise ExacqError("malformed_response", "ExacqVision did not return a playback search handle.")
-        self._request("/playspeed.web/0", {"search_id": search_id})
-        _, _, step_raw = self._request("/step.web/0", {"search_id": search_id, "output": "json"})
-        self._json(step_raw)
-        frame = self._jpeg("/video.web", {"s": self.session_id, "camera": str(camera_id),
-                                            "stream": str(uuid.uuid4()), "search_id": search_id,
-                                            "w": "640", "h": "360", "q": "5", "format": "6"})
-        self._decode_jpeg(frame)
-        _, _, timestamp_raw = self._request("/timestamp.web", {"search_id": search_id, "output": "json"})
-        timestamp = self._json(timestamp_raw)
-        sample_time = timestamp.get("time") if isinstance(timestamp.get("time"), str) else newest_time
+        stream_id = str(uuid.uuid4())
+        timestamps = []
+        try:
+            self._request("/playspeed.web/0", {"search_id": search_id})
+            _, _, step_raw = self._request("/step.web/0", {"search_id": search_id, "output": "json"})
+            self._json(step_raw)
+            self._request("/playspeed.web/1", {"search_id": search_id})
+            # Verify moving recorded media, not just a valid still image. The
+            # timestamp is recorder supplied; repeated JPEG bytes alone are not
+            # evidence that the playback cursor advanced.
+            for index in range(5):
+                frame = self._jpeg("/video.web", {"s": self.session_id, "camera": str(camera_id),
+                                                    "stream": stream_id, "search_id": search_id,
+                                                    "w": "640", "h": "360", "q": "5", "format": "6",
+                                                    "_cache_bust": str(int(time.time() * 1000))})
+                self._decode_jpeg(frame)
+                _, _, timestamp_raw = self._request("/timestamp.web", {"search_id": search_id, "output": "json"})
+                timestamp = self._json(timestamp_raw).get("time")
+                if isinstance(timestamp, str):
+                    timestamps.append(timestamp)
+                if len(set(timestamps)) >= 2:
+                    break
+                if index < 4:
+                    time.sleep(0.6)
+            if len(set(timestamps)) < 2:
+                raise ExacqError("playback_not_advancing", "Recorded frames decoded, but the playback timestamp did not advance.")
+        except ExacqError as error:
+            raise ExacqError(error.code, error.safe_message, search_verified=True) from None
+        finally:
+            try:
+                self._request("/playspeed.web/0", {"search_id": search_id})
+            except ExacqError:
+                pass
         return {"health": "healthy", "reason": None, "newest_recording_at": newest_time,
-                "recorded_sample_at": sample_time, "decoded": True,
+                "recorded_sample_at": timestamps[-1], "decoded": True,
+                "search_verified": True, "playback_verified": True,
                 "duration_ms": round((time.monotonic() - started) * 1000),
                 "evidence": {"frame_count": int(result.get("frames", 0) or 0), "decoder": "ffmpeg",
-                             "media_format": "image/jpeg", "freshness_verified": bool(timestamp.get("time")),
-                             "detail": "Newest recorded search sample retrieved and decoded."}}
+                             "media_format": "image/jpeg", "freshness_verified": True,
+                             "playback_frames_decoded": index + 1,
+                             "detail": "Recorded frames decoded with an advancing playback timestamp."}}
