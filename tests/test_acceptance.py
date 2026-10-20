@@ -108,6 +108,25 @@ class RunningApp(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(200, self.request("/api/v1/auth/me", cookie=headers.get("Set-Cookie").split(";", 1)[0])[0])
 
+    def test_diagnostics_are_admin_only_opt_in_and_return_bounded_safe_events(self):
+        self.env["CHM_DIAGNOSTICS_ENABLED"] = "true"
+        self.restart_app()
+        _, headers, _ = self.request("/api/v1/setup/admin", "POST", {"username": "siteadmin", "password": "A-secure-password-2026"})
+        cookie = headers.get("Set-Cookie").split(";", 1)[0]
+        self.assertEqual(200, self.request("/api/v1/admin/diagnostics", cookie=cookie)[0])
+        operator = self.request("/api/v1/admin/api-tokens", "POST", {
+            "name": "diagnostic operator", "role": "operator", "scopes": ["health:read"]}, cookie)
+        operator_token = json.loads(operator[2])["token"]
+        self.assertEqual(403, self.request("/api/v1/admin/diagnostics", headers={"Authorization": f"Bearer {operator_token}"})[0])
+        admin = self.request("/api/v1/admin/api-tokens", "POST", {
+            "name": "diagnostic admin", "role": "administrator", "scopes": ["diagnostics:read"]}, cookie)
+        admin_token = json.loads(admin[2])["token"]
+        body = json.loads(self.request("/api/v1/admin/diagnostics?limit=10", headers={"Authorization": f"Bearer {admin_token}"})[2])
+        self.assertTrue(body["enabled"])
+        self.assertTrue(body["events"])
+        self.assertLessEqual(len(body["events"]), 10)
+        self.assertTrue(all("password" not in json.dumps(event).lower() for event in body["events"]))
+
     def test_incidents_are_independent_acknowledgeable_and_resolve_after_recovery(self):
         _, headers, _ = self.request("/api/v1/setup/admin", "POST", {"username": "siteadmin", "password": "A-secure-password-2026"})
         cookie = headers.get("Set-Cookie").split(";", 1)[0]
@@ -963,6 +982,29 @@ class RunningApp(unittest.TestCase):
             time.sleep(.1)
         self.assertEqual(9, progress["completed"])
         self.assertTrue(all(item["result"]["reason"] == "no_recent_recording" for item in progress["cameras"]))
+
+    def test_recording_batch_retries_camera_already_under_manual_check(self):
+        cookie = self.login()
+        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Busy recorder", "host": "fixture.local",
+            "adapter": "fixture", "fixture_profile": "recording_slow"}, cookie)
+        server_id = json.loads(body)["id"]
+        self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
+        camera = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
+        _, _, manual_body = self.request(f"/api/v1/cameras/{camera['id']}/recording-check", "POST", {}, cookie)
+        manual_id = json.loads(manual_body)["id"]
+        _, _, batch_body = self.request(f"/api/v1/servers/{server_id}/recording-check", "POST", {}, cookie)
+        batch = json.loads(batch_body)
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            progress = json.loads(self.request(f"/api/v1/recording-batches/{batch['id']}", cookie=cookie)[2])
+            if progress["status"] == "completed":
+                break
+            time.sleep(.05)
+        self.assertEqual("completed", progress["status"])
+        self.assertEqual(1, progress["completed"])
+        self.assertEqual("completed", progress["cameras"][0]["status"])
+        self.assertNotEqual(manual_id, progress["cameras"][0]["job_id"])
+        self.assertEqual("healthy", progress["cameras"][0]["result"]["health"])
 
     def test_live_check_openapi_contract_and_authorization(self):
         contract = json.loads(self.request("/openapi.json")[2])
