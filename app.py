@@ -1017,7 +1017,7 @@ def run_recording_check(job_id, camera, server, lookback_hours):
             db.execute("INSERT INTO recording_check_state(camera_id,checked_at,result_json) VALUES(?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json",
                        (camera["id"], result["checked_at"], json.dumps(result)))
         with RECORDING_CHECK_LOCK:
-            job.update(status="completed", result=result, completed_at=utc_now())
+            job.update(status="finalizing", result=result, completed_at=utc_now())
     except subprocess.TimeoutExpired:
         result = {"health": "unknown", "reason": "timeout", "checked_at": utc_now(), "last_success_at": None,
                   "newest_recording_at": None, "decoded": False, "evidence": {"detail": "Recording sample decode timed out."}}
@@ -1025,7 +1025,7 @@ def run_recording_check(job_id, camera, server, lookback_hours):
             db.execute("INSERT INTO recording_check_state(camera_id,checked_at,result_json) VALUES(?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json",
                        (camera["id"], result["checked_at"], json.dumps(result)))
         with RECORDING_CHECK_LOCK:
-            job.update(status="completed", result=result, completed_at=utc_now())
+            job.update(status="finalizing", result=result, completed_at=utc_now())
     except Exception:
         result = {"health": "unknown", "reason": "connector_unavailable", "checked_at": utc_now(), "last_success_at": None,
                   "newest_recording_at": None, "decoded": False, "evidence": {"detail": "Recording check could not complete."}}
@@ -1033,17 +1033,25 @@ def run_recording_check(job_id, camera, server, lookback_hours):
             db.execute("INSERT INTO recording_check_state(camera_id,checked_at,result_json) VALUES(?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json",
                        (camera["id"], result["checked_at"], json.dumps(result)))
         with RECORDING_CHECK_LOCK:
-            job.update(status="completed", result=result, completed_at=utc_now())
+            job.update(status="finalizing", result=result, completed_at=utc_now())
     finally:
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)
-        with RECORDING_CHECK_LOCK:
-            RECORDING_CHECKS_BY_CAMERA.pop(camera["id"], None)
-        with CAMERA_WORK_LOCK:
-            if CAMERA_WORK_BY_CAMERA.get(camera["id"]) == job_id:
-                CAMERA_WORK_BY_CAMERA.pop(camera["id"], None)
-        persist_scheduled_result(camera["id"], "recording", job)
-        RECORDING_CHECK_SLOTS.release()
+        try:
+            persist_scheduled_result(camera["id"], "recording", job)
+        except Exception:
+            with RECORDING_CHECK_LOCK:
+                job.update(status="failed", error={"code": "state_persistence_failed", "message": "Recording result could not be committed."})
+        else:
+            with RECORDING_CHECK_LOCK:
+                job["status"] = "completed"
+        finally:
+            with RECORDING_CHECK_LOCK:
+                RECORDING_CHECKS_BY_CAMERA.pop(camera["id"], None)
+            with CAMERA_WORK_LOCK:
+                if CAMERA_WORK_BY_CAMERA.get(camera["id"]) == job_id:
+                    CAMERA_WORK_BY_CAMERA.pop(camera["id"], None)
+            RECORDING_CHECK_SLOTS.release()
 
 
 def utc_now():
