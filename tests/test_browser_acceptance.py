@@ -13,10 +13,19 @@ try:
 except ImportError:
     sync_playwright = None
 
+def chromium_available():
+    if not sync_playwright:
+        return False
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).is_file()
+    except Exception:
+        return False
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@unittest.skipUnless(sync_playwright, "Install Playwright and Chromium to run browser acceptance")
+@unittest.skipUnless(chromium_available(), "Install Playwright and Chromium to run browser acceptance")
 class BrowserAcceptance(unittest.TestCase):
     def test_setup_sign_in_dashboard_and_logout(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -57,6 +66,15 @@ class BrowserAcceptance(unittest.TestCase):
                     self.assertTrue(page.get_by_text("ExacqVision Web Service support is enabled.").is_visible())
                     page.get_by_role("button", name="Sign out").click()
                     page.get_by_role("heading", name="Sign in").wait_for()
+                    page.route("**/api/v1/auth/oidc/status", lambda route: route.fulfill(status=200, content_type="application/json", body='{"enabled":true,"button_label":"Sign in with single sign-on"}'))
+                    page.route("**/api/v1/auth/oidc/login", lambda route: route.fulfill(status=302, headers={"Location": f"http://127.0.0.1:{port}/healthz"}, body=""))
+                    sso_button = page.get_by_role("button", name="Sign in with single sign-on")
+                    sso_button.wait_for(state="visible")
+                    with page.expect_request("**/api/v1/auth/oidc/login"):
+                        sso_button.click()
+                    page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+                    page.get_by_role("heading", name="Sign in").wait_for()
+                    page.unroute("**/api/v1/auth/oidc/login")
                     page.get_by_label("Username").fill("siteadmin")
                     page.get_by_label("Password").fill("A-secure-password-2026")
                     page.get_by_role("button", name="Sign in").click()
@@ -94,8 +112,11 @@ class BrowserAcceptance(unittest.TestCase):
                     page.get_by_text("Live frames decoded; source timestamp", exact=False).wait_for(timeout=8000)
                     configured = page.request.post(f"http://127.0.0.1:{port}/api/v1/webhooks", data={"name":"Browser receiver","url":f"http://127.0.0.1:{port}/healthz","events":["incident.opened"]})
                     self.assertEqual(201, configured.status)
+                    page.set_viewport_size({"width": 613, "height": 978})
                     page.get_by_role("button", name="Webhooks").click()
                     page.get_by_role("heading", name="Webhook receivers").wait_for()
+                    self.assertLessEqual(page.locator("#webhook-dialog").evaluate("node => node.scrollWidth - node.clientWidth"), 1)
+                    self.assertLessEqual(page.locator("#webhook-form").evaluate("node => node.scrollWidth - node.clientWidth"), 1)
                     self.assertTrue(page.get_by_label("Receiver name").is_visible())
                     self.assertTrue(page.get_by_label("Signing secret (optional, 16–256 characters)").is_visible())
                     self.assertTrue(page.get_by_text("incident.opened", exact=True).is_visible())
