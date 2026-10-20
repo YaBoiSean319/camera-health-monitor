@@ -234,6 +234,16 @@ class ExacqClient:
                 "sample_timestamp": None, "freshness_verified": False, "decoder": "ffmpeg",
                 "detail": "Three live-endpoint frames were decoded. ExacqVision supplied no source capture timestamp, so wall-clock freshness cannot be independently confirmed."}
 
+    def live_frame(self, camera_id, stream_id):
+        """Retrieve one JPEG frame for a short-lived browser live-view session."""
+        if not self.session_id:
+            self.login()
+        return self._jpeg("/video.web", {
+            "s": self.session_id, "camera": str(camera_id), "stream": str(stream_id),
+            "w": "1280", "h": "720", "q": "5", "format": "6",
+            "_cache_bust": str(int(time.time() * 1000)),
+        })
+
     def _search(self, camera_id, start, end):
         result = self._session_json("/search.web", {"camera": str(camera_id), "start": start, "end": end, "output": "json"})
         deadline = time.monotonic() + MAX_SEARCH_WAIT_SECONDS
