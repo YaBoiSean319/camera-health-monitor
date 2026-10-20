@@ -77,13 +77,13 @@ function showError(form, error) {
 }
 function renderSetup() {
   const name = escapeHtml(sharedBranding.app_name);
-  appRoot.innerHTML = `<section class="auth-card">${brandMark()}<p class="eyebrow">FIRST RUN</p><h1>Set up your monitor</h1><p class="muted">Create the local administrator account. This setup link becomes unavailable after the first account is created.</p>${themePicker()}
+  appRoot.innerHTML = `<section class="auth-card">${brandMark()}<p class="eyebrow">FIRST RUN</p><h1>Set up your monitor</h1><p class="muted">Create the local administrator account. This setup link becomes unavailable after the first account is created.</p>
     <form id="setup-form"><label>Username<input name="username" autocomplete="username" required maxlength="64"></label><label>Password<input name="password" type="password" autocomplete="new-password" required minlength="12"><small>Use at least 12 characters.</small></label><p class="form-error" data-error hidden></p><button class="primary">Create administrator</button></form><small class="auth-app-name">${name}</small></section>`;
   document.querySelector("#setup-form").addEventListener("submit", async event => { event.preventDefault(); const form = event.currentTarget; try { await api("setup/admin", { method: "POST", body: JSON.stringify(formData(form)) }); renderDashboard(); } catch (error) { showError(form, error); } });
 }
 async function renderLogin() {
   const name = escapeHtml(sharedBranding.app_name);
-  appRoot.innerHTML = `<section class="auth-card">${brandMark()}<p class="eyebrow">CAMERA OPERATIONS</p><h1>Sign in</h1><p class="muted">Use your local administrator account to continue.</p>${themePicker()}
+  appRoot.innerHTML = `<section class="auth-card">${brandMark()}<p class="eyebrow">CAMERA OPERATIONS</p><h1>Sign in</h1><p class="muted">Use your local administrator account to continue.</p>
     <form id="login-form"><label>Username<input name="username" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><p class="form-error" data-error hidden></p><button class="primary">Sign in</button></form>
     <button id="sso-login" class="sso-button" type="button" hidden>${sharedBranding.assets?.sso_logo ? `<img src="${escapeHtml(sharedBranding.assets.sso_logo)}" alt="">` : ""}${escapeHtml(sharedBranding.sso_button_text)}</button><small class="auth-app-name">${name}</small></section>`;
   document.querySelector("#login-form").addEventListener("submit", async event => { event.preventDefault(); const form = event.currentTarget; try { await api("auth/login", { method: "POST", body: JSON.stringify(formData(form)) }); renderDashboard(); } catch (error) { showError(form, error); } });
