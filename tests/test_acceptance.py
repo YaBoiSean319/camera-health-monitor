@@ -5,6 +5,7 @@ import base64
 import struct
 import zlib
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -893,7 +894,7 @@ class RunningApp(unittest.TestCase):
         server_id = json.loads(body)["id"]
         status, _, body = self.request(f"/api/v1/servers/{server_id}/recording-check", "POST", {}, cookie)
         self.assertEqual(202, status)
-        self.assertEqual([], json.loads(body)["jobs"])
+        self.assertEqual(0, json.loads(body)["total"])
         self.assertEqual(400, self.request(f"/api/v1/cameras/not-real", "PUT", {"overrides": {"recording_lookback_hours": 0}}, cookie)[0])
 
     def test_recording_window_includes_exact_boundary_and_camera_override_changes_window(self):
@@ -928,10 +929,40 @@ class RunningApp(unittest.TestCase):
         self.assertEqual(202, status)
         batch = json.loads(body)
         self.assertEqual(server_id, batch["server_id"])
-        self.assertEqual(1, len(batch["jobs"]))
+        self.assertEqual(1, batch["total"])
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            progress = json.loads(self.request(f"/api/v1/recording-batches/{batch['id']}", cookie=cookie)[2])
+            if progress["status"] == "completed": break
+            time.sleep(.05)
+        self.assertEqual(1, progress["completed"])
+        self.assertEqual("completed", progress["cameras"][0]["status"])
         spec = json.loads(self.request("/openapi.json")[2])
         self.assertIn("/cameras/{camera_id}/recording-check", spec["paths"])
         self.assertIn("/servers/{server_id}/recording-check", spec["paths"])
+        self.assertIn("/recording-batches/{batch_id}", spec["paths"])
+
+    def test_recording_batch_queues_more_cameras_than_worker_slots(self):
+        cookie = self.login()
+        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Motion recorder", "host": "fixture.local", "adapter": "fixture", "fixture_profile": "recording_none"}, cookie)
+        server_id = json.loads(body)["id"]
+        self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
+        with sqlite3.connect(Path(self.temp.name) / "camera-health-monitor.sqlite3") as db:
+            original = db.execute("SELECT settings_json FROM cameras WHERE server_id=?", (server_id,)).fetchone()[0]
+            for index in range(2, 10):
+                db.execute("INSERT INTO cameras(id,server_id,remote_id,name,settings_json) VALUES(?,?,?,?,?)",
+                           (f"batch-camera-{index}", server_id, str(index), f"Fixture camera {index}", original))
+        status, _, body = self.request(f"/api/v1/servers/{server_id}/recording-check", "POST", {}, cookie)
+        self.assertEqual(202, status)
+        batch = json.loads(body)
+        self.assertEqual(9, batch["total"])
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            progress = json.loads(self.request(f"/api/v1/recording-batches/{batch['id']}", cookie=cookie)[2])
+            if progress["status"] == "completed": break
+            time.sleep(.1)
+        self.assertEqual(9, progress["completed"])
+        self.assertTrue(all(item["result"]["reason"] == "no_recent_recording" for item in progress["cameras"]))
 
     def test_live_check_openapi_contract_and_authorization(self):
         contract = json.loads(self.request("/openapi.json")[2])

@@ -62,6 +62,8 @@ RECORDING_CHECKS_BY_CAMERA = {}
 RECORDING_CHECK_LOCK = threading.RLock()
 RECORDING_CHECK_EXECUTOR = ThreadPoolExecutor(max_workers=LIVE_CHECK_LIMIT, thread_name_prefix="recording-check")
 RECORDING_CHECK_SLOTS = threading.BoundedSemaphore(LIVE_CHECK_LIMIT)
+RECORDING_BATCHES = {}
+RECORDING_BATCH_LOCK = threading.RLock()
 CAMERA_WORK_LOCK = threading.RLock()
 CAMERA_WORK_BY_CAMERA = {}
 SCHEDULER_WAKE = threading.Event()
@@ -771,6 +773,54 @@ def recording_check_public(job):
     return {key: job[key] for key in ("id", "camera_id", "server_id", "status", "created_at", "started_at", "completed_at", "lookback_hours", "result", "error")}
 
 
+def recording_batch_public(batch):
+    jobs = list(batch["cameras"].values())
+    return {"id": batch["id"], "server_id": batch["server_id"], "status": batch["status"],
+            "total": len(jobs), "completed": sum(item["status"] in ("completed", "skipped", "error") for item in jobs),
+            "cameras": jobs}
+
+
+def run_recording_batch(batch_id, cameras, server):
+    pending = list(cameras)
+    active = {}
+    capacity_wait_started = None
+    while pending or active:
+        while pending and len(active) < LIVE_CHECK_LIMIT:
+            camera = pending[0]
+            job, active_id, error = start_recording_check(camera, server)
+            if error == "capacity":
+                capacity_wait_started = capacity_wait_started or time.monotonic()
+                if time.monotonic() - capacity_wait_started > 120:
+                    with RECORDING_BATCH_LOCK:
+                        for remaining in pending:
+                            RECORDING_BATCHES[batch_id]["cameras"][remaining["id"]].update(status="error", reason="check_capacity_reached")
+                    pending.clear()
+                break
+            capacity_wait_started = None
+            pending.pop(0)
+            with RECORDING_BATCH_LOCK:
+                item = RECORDING_BATCHES[batch_id]["cameras"][camera["id"]]
+                item.update(status="running" if job else "skipped", job_id=job["id"] if job else active_id,
+                            reason=error if error else None)
+            if job:
+                active[camera["id"]] = job["id"]
+        for camera_id, job_id in list(active.items()):
+            with RECORDING_CHECK_LOCK:
+                job = RECORDING_CHECKS.get(job_id)
+                done = job and job["status"] in ("completed", "failed", "cancelled")
+                snapshot = recording_check_public(job) if done else None
+            if snapshot:
+                with RECORDING_BATCH_LOCK:
+                    RECORDING_BATCHES[batch_id]["cameras"][camera_id].update(
+                        status="completed" if snapshot["status"] == "completed" else "error",
+                        result=snapshot["result"], reason=(snapshot["error"] or {}).get("code"))
+                del active[camera_id]
+        if pending or active:
+            time.sleep(0.25)
+    with RECORDING_BATCH_LOCK:
+        RECORDING_BATCHES[batch_id]["status"] = "completed"
+
+
 def mark_monitoring_job(camera_id, check_type, job_id):
     now = utc_now()
     with connect_db() as db:
@@ -850,10 +900,12 @@ def persist_scheduled_result(camera_id, check_type, job):
                 update_server_capability(server_id, "recording_search", "verified", "Recording search completed successfully; no footage was present in the requested lookback window.")
             elif result.get("health") == "healthy":
                 update_server_capability(server_id, "recording_search", "verified", "Recording search returned one or more footage intervals.")
-                update_server_capability(server_id, "recorded_playback", "verified", "A frame from the newest recording was retrieved and decoded.")
-            elif result.get("reason") in ("decode_failed", "video_unavailable"):
+                if result.get("playback_verified"):
+                    update_server_capability(server_id, "recorded_playback", "verified", "Recorded frames decoded and playback time advanced.")
+            elif result.get("search_verified"):
                 update_server_capability(server_id, "recording_search", "verified", "Recording search returned footage intervals.")
-                update_server_capability(server_id, "recorded_playback", "failed", "The newest recording sample could not be retrieved or decoded.")
+                if result.get("reason") != "playback_not_advancing":
+                    update_server_capability(server_id, "recorded_playback", "failed", "Recorded frames could not be retrieved or decoded.")
     if MONITORING_SCHEDULE is not None and job.get("scheduled"):
         MONITORING_SCHEDULE.complete(camera_id, check_type)
 
@@ -913,6 +965,7 @@ def run_recording_check(job_id, camera, server, lookback_hours):
                 result = {"health": "failure" if media_failed else "unknown", "reason": error.code,
                           "checked_at": checked_at, "last_success_at": prior_success,
                           "newest_recording_at": None, "decoded": False,
+                          "search_verified": error.search_verified, "playback_verified": False,
                           "evidence": {"detail": error.safe_message}}
         else:
             if profile == "recording_permission_error":
@@ -964,7 +1017,7 @@ def run_recording_check(job_id, camera, server, lookback_hours):
             db.execute("INSERT INTO recording_check_state(camera_id,checked_at,result_json) VALUES(?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json",
                        (camera["id"], result["checked_at"], json.dumps(result)))
         with RECORDING_CHECK_LOCK:
-            job.update(status="completed", result=result, completed_at=utc_now())
+            job.update(status="finalizing", result=result, completed_at=utc_now())
     except subprocess.TimeoutExpired:
         result = {"health": "unknown", "reason": "timeout", "checked_at": utc_now(), "last_success_at": None,
                   "newest_recording_at": None, "decoded": False, "evidence": {"detail": "Recording sample decode timed out."}}
@@ -972,7 +1025,7 @@ def run_recording_check(job_id, camera, server, lookback_hours):
             db.execute("INSERT INTO recording_check_state(camera_id,checked_at,result_json) VALUES(?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json",
                        (camera["id"], result["checked_at"], json.dumps(result)))
         with RECORDING_CHECK_LOCK:
-            job.update(status="completed", result=result, completed_at=utc_now())
+            job.update(status="finalizing", result=result, completed_at=utc_now())
     except Exception:
         result = {"health": "unknown", "reason": "connector_unavailable", "checked_at": utc_now(), "last_success_at": None,
                   "newest_recording_at": None, "decoded": False, "evidence": {"detail": "Recording check could not complete."}}
@@ -980,17 +1033,25 @@ def run_recording_check(job_id, camera, server, lookback_hours):
             db.execute("INSERT INTO recording_check_state(camera_id,checked_at,result_json) VALUES(?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json",
                        (camera["id"], result["checked_at"], json.dumps(result)))
         with RECORDING_CHECK_LOCK:
-            job.update(status="completed", result=result, completed_at=utc_now())
+            job.update(status="finalizing", result=result, completed_at=utc_now())
     finally:
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)
-        with RECORDING_CHECK_LOCK:
-            RECORDING_CHECKS_BY_CAMERA.pop(camera["id"], None)
-        with CAMERA_WORK_LOCK:
-            if CAMERA_WORK_BY_CAMERA.get(camera["id"]) == job_id:
-                CAMERA_WORK_BY_CAMERA.pop(camera["id"], None)
-        persist_scheduled_result(camera["id"], "recording", job)
-        RECORDING_CHECK_SLOTS.release()
+        try:
+            persist_scheduled_result(camera["id"], "recording", job)
+        except Exception:
+            with RECORDING_CHECK_LOCK:
+                job.update(status="failed", error={"code": "state_persistence_failed", "message": "Recording result could not be committed."})
+        else:
+            with RECORDING_CHECK_LOCK:
+                job["status"] = "completed"
+        finally:
+            with RECORDING_CHECK_LOCK:
+                RECORDING_CHECKS_BY_CAMERA.pop(camera["id"], None)
+            with CAMERA_WORK_LOCK:
+                if CAMERA_WORK_BY_CAMERA.get(camera["id"]) == job_id:
+                    CAMERA_WORK_BY_CAMERA.pop(camera["id"], None)
+            RECORDING_CHECK_SLOTS.release()
 
 
 def utc_now():
@@ -1507,7 +1568,8 @@ def openapi_document():
             "/servers/{server_id}/capabilities": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Read independent capability status (servers:read)", "responses": {"200": json_response("Capabilities", {"type": "object"})}}, "post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Test Web Service authentication and server status (servers:write)", "responses": {"200": json_response("Connection result and capabilities", {"type": "object"}), "502": {"description": "Connection or authentication failed"}}}},
             "/cameras": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "List persistent camera inventory (cameras:read)", "responses": {"200": json_response("Camera inventory", {"type": "array", "items": {"$ref": "#/components/schemas/Camera"}})}}},
             "/cameras/{camera_id}/recording-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start an asynchronous recent recording search and sample decode (checks:run)", "responses": {"202": json_response("Queued recording check", {"$ref": "#/components/schemas/RecordingCheckJob"}), "409": {"description": "Camera unavailable or check already running"}, "429": {"description": "Check capacity reached"}, "502": {"description": "ExacqVision connection or recording request failed"}}}},
-            "/servers/{server_id}/recording-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start checks for all present cameras on a server (checks:run)", "responses": {"202": json_response("Queued per-camera jobs", {"type": "object"}), "502": {"description": "ExacqVision connection or recording request failed"}}}},
+            "/servers/{server_id}/recording-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Queue checks for all present cameras on a server (checks:run)", "responses": {"202": json_response("Recording batch progress and per-camera results", {"type": "object"})}}},
+            "/recording-batches/{batch_id}": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Poll queued recording checks, including no-footage and playback results (health:read)", "responses": {"200": json_response("Recording batch progress", {"type": "object"}), "404": {"description": "Batch not found"}}}},
             "/recording-checks/{job_id}": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Poll a recording-check result (health:read)", "responses": {"200": json_response("Recording-check state and evidence", {"$ref": "#/components/schemas/RecordingCheckJob"}), "404": {"description": "Check not found"}}}},
             "/cameras/{camera_id}/live-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start an asynchronous live sample retrieval and decode check (checks:run)", "responses": {"202": json_response("Queued check", {"$ref": "#/components/schemas/LiveCheckJob"}), "404": {"description": "Camera not found"}, "409": {"description": "Camera unavailable or a check already running"}, "429": {"description": "Check capacity reached"}, "502": {"description": "ExacqVision connection or live sample request failed"}}}},
             "/live-checks/{job_id}": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Poll a live-check result (health:read)", "responses": {"200": json_response("Live-check state and decode result", {"$ref": "#/components/schemas/LiveCheckJob"}), "404": {"description": "Check not found"}}}, "delete": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Cancel an active live check (checks:run)", "responses": {"202": json_response("Cancellation requested", {"$ref": "#/components/schemas/LiveCheckJob"}), "409": {"description": "Check is already terminal"}}}},
@@ -1790,6 +1852,8 @@ def app(environ, start_response):
         required_scope = "health:read" if method == "GET" else "checks:run"
     if route.startswith("recording-checks/"):
         required_scope = "health:read"
+    if route.startswith("recording-batches/"):
+        required_scope = "health:read"
     if route == "maintenance":
         required_scope = "maintenance:read" if method == "GET" else "maintenance:write"
     if route.startswith("maintenance/"):
@@ -1970,7 +2034,8 @@ def app(environ, start_response):
     is_incident_route = route == "incidents" or route.startswith("incidents/") or route == "history"
     is_live_check_route = route.startswith("live-checks/")
     is_recording_check_route = route.startswith("recording-checks/")
-    if route in ("dashboard", "monitoring", "incidents", "history", "maintenance", "admin/credentials", "branding", "branding/assets") or route.startswith("maintenance/") or is_server_route or is_camera_route or is_incident_route or is_live_check_route or is_recording_check_route:
+    is_recording_batch_route = route.startswith("recording-batches/")
+    if route in ("dashboard", "monitoring", "incidents", "history", "maintenance", "admin/credentials", "branding", "branding/assets") or route.startswith("maintenance/") or is_server_route or is_camera_route or is_incident_route or is_live_check_route or is_recording_check_route or is_recording_batch_route:
         if not principal:
             return response(start_response, 401, {"error": "unauthorized"})
         server_config_mutation = (route == "servers" and method == "POST") or (route.startswith("servers/") and method != "GET" and not route.endswith(("/discover", "/recording-check")))
@@ -2148,6 +2213,7 @@ def app(environ, start_response):
             server = {key: camera[key] for key in ("host", "web_scheme", "web_port")}
             client = exacq.ExacqClient(server, camera["username"], password, timeout=LIVE_CHECK_TIMEOUT)
             stream_id = str(uuid.uuid4())
+            frame_rate = 5 if query.get("quality", ["smooth"])[0] == "low" else 15
             try:
                 first_frame = client.live_frame(camera["remote_id"], stream_id)
             except exacq.ExacqError as error:
@@ -2158,14 +2224,16 @@ def app(environ, start_response):
                 frame = first_frame
                 try:
                     while True:
+                        sent_at = time.monotonic()
                         yield b"--" + boundary + b"\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
-                        time.sleep(0.4)
+                        time.sleep(max(0, 1 / frame_rate - (time.monotonic() - sent_at)))
                         frame = client.live_frame(camera["remote_id"], stream_id)
                 except (exacq.ExacqError, GeneratorExit):
                     return
 
             start_response("200 OK", [("Content-Type", "multipart/x-mixed-replace; boundary=chmframe"),
                                        ("Cache-Control", "no-store, no-cache, must-revalidate"),
+                                       ("X-Accel-Buffering", "no"),
                                        ("X-Content-Type-Options", "nosniff")])
             return live_feed()
         if route.startswith("cameras/") and route.endswith("/live-check") and method == "POST":
@@ -2200,6 +2268,10 @@ def app(environ, start_response):
             with RECORDING_CHECK_LOCK:
                 job = RECORDING_CHECKS.get(route.split("/", 1)[1])
                 return response(start_response, 200, recording_check_public(job)) if job else response(start_response, 404, {"error": "recording_check_not_found"})
+        if route.startswith("recording-batches/") and method == "GET":
+            with RECORDING_BATCH_LOCK:
+                batch = RECORDING_BATCHES.get(route.split("/", 1)[1])
+                return response(start_response, 200, recording_batch_public(batch)) if batch else response(start_response, 404, {"error": "recording_batch_not_found"})
         if route.startswith("servers/") and route.endswith("/recording-check") and method == "POST":
             server_id = route.split("/")[1]
             with connect_db() as db:
@@ -2207,16 +2279,20 @@ def app(environ, start_response):
                 if not server: return response(start_response, 404, {"error": "server_not_found"})
                 if not server["enabled"]: return response(start_response, 409, {"error": "server_disabled"})
                 cameras = db.execute("SELECT * FROM cameras WHERE server_id=? AND disappeared=0 AND disabled=0 ORDER BY remote_id", (server_id,)).fetchall()
-            jobs = []
-            for camera in cameras:
-                job, active_id, error = start_recording_check(dict(camera), dict(server))
-                if job: jobs.append(recording_check_public(job))
-                elif error == "duplicate":
-                    active_recording = RECORDING_CHECKS.get(active_id)
-                    jobs.append(recording_check_public(active_recording) if active_recording else
-                                 {"camera_id": camera["id"], "status": "conflict", "active_job_id": active_id})
-                elif error == "capacity": return response(start_response, 429, {"error": "check_capacity_reached", "jobs": jobs})
-            return response(start_response, 202, {"server_id": server_id, "jobs": jobs})
+            with RECORDING_BATCH_LOCK:
+                running = next((batch for batch in RECORDING_BATCHES.values() if batch["server_id"] == server_id and batch["status"] == "running"), None)
+                if running:
+                    return response(start_response, 200, recording_batch_public(running))
+                batch_id = str(uuid.uuid4())
+                batch = {"id": batch_id, "server_id": server_id, "status": "running", "cameras": {
+                    camera["id"]: {"camera_id": camera["id"], "camera_name": camera["name"], "status": "queued", "job_id": None, "result": None, "reason": None}
+                    for camera in cameras}}
+                RECORDING_BATCHES[batch_id] = batch
+                if len(RECORDING_BATCHES) > 20:
+                    oldest = next((key for key, item in RECORDING_BATCHES.items() if key != batch_id and item["status"] == "completed"), None)
+                    if oldest: RECORDING_BATCHES.pop(oldest)
+            threading.Thread(target=run_recording_batch, args=(batch_id, [dict(camera) for camera in cameras], dict(server)), daemon=True).start()
+            return response(start_response, 202, recording_batch_public(batch), [("Location", f"/api/v1/recording-batches/{batch_id}")])
         if route.startswith("live-checks/"):
             job_id = route.split("/", 1)[1]
             with LIVE_CHECK_LOCK:

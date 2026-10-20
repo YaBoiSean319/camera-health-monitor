@@ -19,6 +19,9 @@ class ExacqHandler(BaseHTTPRequestHandler):
     jpeg = b""
     bad_password = False
     requests_seen = []
+    playback_counter = 0
+    freeze_playback = False
+    no_recordings = False
 
     def log_message(self, *_args):
         pass
@@ -67,6 +70,8 @@ class ExacqHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return self.wfile.write(self.jpeg)
         if parsed.path == "/search.web":
+            if self.no_recordings:
+                return self.send_json({"search_id": "synthetic-search", "frames": 0, "videoInfo": []})
             now = datetime.now(timezone.utc)
             start = (now - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
             end = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -74,7 +79,7 @@ class ExacqHandler(BaseHTTPRequestHandler):
                                    "videoInfo": [{"deviceId": "101", "clips": [{"startTime": start, "endTime": end}]}]})
         if parsed.path == "/search.web/status":
             return self.send_json({"success": True, "status": {"status": 2, "frames": {"total": 12, "retrieved": 12}}})
-        if parsed.path == "/playspeed.web/0":
+        if parsed.path in ("/playspeed.web/0", "/playspeed.web/1"):
             data = b"0"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -84,7 +89,9 @@ class ExacqHandler(BaseHTTPRequestHandler):
         if parsed.path == "/step.web/0":
             return self.send_json({"frame": "0"})
         if parsed.path == "/timestamp.web":
-            return self.send_json({"time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+            if not self.freeze_playback:
+                type(self).playback_counter += 1
+            return self.send_json({"time": datetime.fromtimestamp(1_600_000_000 + self.playback_counter, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
         self.send_error(404)
 
 
@@ -101,6 +108,9 @@ class ExacqClientTests(unittest.TestCase):
     def setUp(self):
         ExacqHandler.bad_password = False
         ExacqHandler.requests_seen = []
+        ExacqHandler.playback_counter = 0
+        ExacqHandler.freeze_playback = False
+        ExacqHandler.no_recordings = False
         self.server = ExacqFixtureServer(("127.0.0.1", 0), ExacqHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -151,11 +161,28 @@ class ExacqClientTests(unittest.TestCase):
         result = self.client().check_recording("101", 24)
         self.assertEqual("healthy", result["health"])
         self.assertTrue(result["decoded"])
+        self.assertTrue(result["playback_verified"])
+        self.assertGreaterEqual(result["evidence"]["playback_frames_decoded"], 2)
         self.assertEqual(12, result["evidence"]["frame_count"])
         paths = [path for method, path, _ in ExacqHandler.requests_seen if method == "GET"]
         self.assertIn("/search.web", paths)
         self.assertIn("/step.web/0", paths)
         self.assertIn("/timestamp.web", paths)
+        self.assertIn("/playspeed.web/1", paths)
+
+    def test_recorded_frame_without_advancing_timestamp_does_not_verify_playback(self):
+        ExacqHandler.freeze_playback = True
+        with self.assertRaises(exacq.ExacqError) as raised:
+            self.client().check_recording("101", 24)
+        self.assertEqual("playback_not_advancing", raised.exception.code)
+        self.assertTrue(raised.exception.search_verified)
+
+    def test_empty_motion_window_verifies_search_without_claiming_playback(self):
+        ExacqHandler.no_recordings = True
+        result = self.client().check_recording("101", 24)
+        self.assertEqual("no_recent_recording", result["reason"])
+        self.assertTrue(result["search_verified"])
+        self.assertFalse(result["playback_verified"])
 
     def test_invalid_credentials_are_reported_without_echoing_server_details(self):
         ExacqHandler.bad_password = True
