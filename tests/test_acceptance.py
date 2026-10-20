@@ -408,7 +408,7 @@ class RunningApp(unittest.TestCase):
         self.assertEqual(server_id, camera["server_id"])
         self.assertEqual("camera-1", camera["remote_id"])
         self.assertEqual("untested", camera["capabilities"]["live_delivery"]["status"])
-        self.assertEqual({"live_interval_minutes": 5, "recording_interval_minutes": 60, "recording_lookback_hours": 24}, camera["settings"])
+        self.assertEqual({"live_interval_minutes": 5, "recording_interval_minutes": 60, "recording_lookback_hours": 24, "recording_expected": True}, camera["settings"])
         self.assertEqual(200, self.request(f"/api/v1/cameras/{camera_id}", "PUT", {"overrides": {"recording_lookback_hours": 48}}, cookie)[0])
         self.assertEqual(200, self.request(f"/api/v1/servers/{server_id}", cookie=cookie)[0])
         status, _, updated = self.request(f"/api/v1/servers/{server_id}", "PUT", {"name": "Renamed recorder", "password": ""}, cookie)
@@ -455,19 +455,23 @@ class RunningApp(unittest.TestCase):
         self.assertEqual(set(server_ids), {camera["server_id"] for camera in cameras})
         self.assertEqual(2, len({camera["id"] for camera in cameras}))
 
-    def test_unsupported_exacq_probe_and_discovery_report_unknown_without_claiming_compatibility(self):
+    def test_exacq_connection_probe_and_discovery_report_sanitized_failure(self):
         cookie = self.login()
         status, _, body = self.request("/api/v1/servers", "POST", {
-            "name": "Production recorder", "host": "exacq.local", "adapter": "exacq"
+            "name": "Production recorder", "host": "127.0.0.1", "web_port": 1, "adapter": "exacq"
         }, cookie)
         self.assertEqual(201, status)
         server_id = json.loads(body)["id"]
         status, _, body = self.request(f"/api/v1/servers/{server_id}/capabilities", "POST", {}, cookie)
-        self.assertEqual(200, status)
+        self.assertEqual(502, status)
         caps = json.loads(body)["capabilities"]
-        self.assertEqual({"untested"}, {cap["status"] for cap in caps.values()})
-        self.assertEqual(501, self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)[0])
-        self.assertEqual("untested", json.loads(self.request("/api/v1/servers", cookie=cookie)[2])[0]["capabilities"]["camera_discovery"]["status"])
+        self.assertEqual("failed", caps["web_service"]["status"])
+        self.assertEqual("untested", caps["camera_discovery"]["status"])
+        self.assertEqual(502, self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)[0])
+        current = next(s for s in json.loads(self.request("/api/v1/servers", cookie=cookie)[2]) if s["id"] == server_id)
+        self.assertEqual("failed", current["capabilities"]["camera_discovery"]["status"])
+        self.assertNotIn("username", current)
+        self.assertNotIn("password", current)
 
     def test_fixture_errors_and_disappeared_camera_are_visible_and_preserve_history(self):
         cookie = self.login()
@@ -570,7 +574,7 @@ class RunningApp(unittest.TestCase):
 
         self.assertEqual(401, self.request(f"/api/v1/live-checks/{job_id}")[0])
 
-    def test_live_check_invalid_media_fails_decode_and_exacq_stays_unverified(self):
+    def test_live_check_invalid_media_fails_decode_and_exacq_connection_failure_is_reported(self):
         cookie = self.login()
         _, _, body = self.request("/api/v1/servers", "POST", {
             "name": "Fixture recorder", "host": "fixture.local", "adapter": "fixture", "fixture_profile": "invalid_media"
@@ -591,9 +595,9 @@ class RunningApp(unittest.TestCase):
         self.assertEqual("decode_failed", result["error"]["code"])
         self.assertEqual([], list(Path(self.temp.name).glob("chm-live-*")))
 
-        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Real", "host": "nvr.local"}, cookie)
+        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Real", "host": "127.0.0.1", "web_port": 1}, cookie)
         exacq_id = json.loads(body)["id"]
-        self.assertEqual(501, self.request(f"/api/v1/servers/{exacq_id}/discover", "POST", {}, cookie)[0])
+        self.assertEqual(502, self.request(f"/api/v1/servers/{exacq_id}/discover", "POST", {}, cookie)[0])
         self.assertFalse(any(camera["server_id"] == exacq_id for camera in json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])))
 
     def test_live_check_prevents_overlap_and_can_be_cancelled(self):
@@ -814,6 +818,29 @@ class RunningApp(unittest.TestCase):
         self.assertEqual("completed", result["status"])
         self.assertEqual("warning", result["result"]["health"])
         self.assertEqual("no_recent_recording", result["result"]["reason"])
+
+    def test_camera_can_disable_missing_recording_alert_without_hiding_result(self):
+        cookie = self.login()
+        _, _, body = self.request("/api/v1/servers", "POST", {
+            "name": "Quiet fixture", "host": "quiet.local", "adapter": "fixture", "fixture_profile": "recording_none"
+        }, cookie)
+        server_id = json.loads(body)["id"]
+        self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, cookie)
+        camera = next(item for item in json.loads(self.request("/api/v1/cameras", cookie=cookie)[2]) if item["server_id"] == server_id)
+        self.assertEqual(200, self.request(f"/api/v1/cameras/{camera['id']}", "PUT", {"overrides": {"recording_expected": False}}, cookie)[0])
+        status, _, body = self.request(f"/api/v1/cameras/{camera['id']}/recording-check", "POST", {}, cookie)
+        self.assertEqual(202, status)
+        job_id = json.loads(body)["id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            result = json.loads(self.request(f"/api/v1/recording-checks/{job_id}", cookie=cookie)[2])
+            if result["status"] == "completed":
+                break
+            time.sleep(.05)
+        self.assertEqual("warning", result["result"]["health"])
+        self.assertEqual("no_recent_recording", result["result"]["reason"])
+        incidents = json.loads(self.request("/api/v1/incidents", cookie=cookie)[2])
+        self.assertFalse(any(item.get("entity_id") == camera["id"] and item.get("status") == "open" for item in incidents))
         updated = json.loads(self.request("/api/v1/cameras", cookie=cookie)[2])[0]
         self.assertEqual("warning", updated["recording_status"]["health"])
         self.assertIsNone(updated["recording_status"]["newest_recording_at"])
@@ -847,11 +874,13 @@ class RunningApp(unittest.TestCase):
                 self.assertEqual(reason, result["result"]["reason"])
         self.assertEqual([], list(Path(self.temp.name).glob("chm-recording-*")))
 
-    def test_recording_lookback_is_independently_validated_and_real_exacq_remains_unknown(self):
+    def test_recording_lookback_validation_and_server_batch_check_without_inventory(self):
         cookie = self.login()
-        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Real", "host": "nvr.local"}, cookie)
+        _, _, body = self.request("/api/v1/servers", "POST", {"name": "Real", "host": "127.0.0.1", "web_port": 1}, cookie)
         server_id = json.loads(body)["id"]
-        self.assertEqual(501, self.request(f"/api/v1/servers/{server_id}/recording-check", "POST", {}, cookie)[0])
+        status, _, body = self.request(f"/api/v1/servers/{server_id}/recording-check", "POST", {}, cookie)
+        self.assertEqual(202, status)
+        self.assertEqual([], json.loads(body)["jobs"])
         self.assertEqual(400, self.request(f"/api/v1/cameras/not-real", "PUT", {"overrides": {"recording_lookback_hours": 0}}, cookie)[0])
 
     def test_recording_window_includes_exact_boundary_and_camera_override_changes_window(self):

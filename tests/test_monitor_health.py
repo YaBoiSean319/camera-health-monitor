@@ -73,10 +73,11 @@ class MonitorHealthTests(unittest.TestCase):
             event = json.loads(db.execute("SELECT payload_json FROM event_outbox WHERE event_type='monitoring.heartbeat' ORDER BY created_at LIMIT 1").fetchone()[0])
             self.assertEqual(1, event["version"])
 
-    def test_unknown_camera_auth_result_does_not_open_camera_incident(self):
+    def test_camera_auth_failure_opens_one_server_incident_not_a_camera_incident(self):
         with app.connect_db() as db:
             app.update_incident(db, "camera", "camera-1", "server-1", "live", "unknown", "permission_denied", "2026-01-01T00:00:00Z")
-            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM monitoring_incidents").fetchone()[0])
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM monitoring_incidents WHERE entity_type='server' AND reason='authentication_failed'").fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM monitoring_incidents WHERE entity_type='camera'").fetchone()[0])
 
 
 if __name__ == "__main__":

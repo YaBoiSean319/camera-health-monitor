@@ -182,12 +182,12 @@ class OIDCAcceptance(unittest.TestCase):
         self.assertEqual(403, self.request("/api/v1/admin/credentials", "PUT", {"current_password": "x", "username": "x"}, oidc_cookie)[0])
         self.assertEqual(403, self.request("/api/v1/admin/auth/oidc", cookie=oidc_cookie)[0])
         self.assertEqual(200, self.request("/api/v1/dashboard", cookie=oidc_cookie)[0])
-        status, _, body = self.request("/api/v1/servers", "POST", {"name": "Production", "host": "exacq.example.test"}, self.admin_cookie)
+        status, _, body = self.request("/api/v1/servers", "POST", {"name": "Production", "host": "127.0.0.1", "web_port": 1}, self.admin_cookie)
         self.assertEqual(201, status)
         server_id = json.loads(body)["id"]
         self.assertEqual(403, self.request("/api/v1/servers", "POST", {"name": "Unauthorized", "host": "bad.example"}, oidc_cookie)[0])
         self.assertEqual(403, self.request(f"/api/v1/servers/{server_id}", "PUT", {"name": "Tampered"}, oidc_cookie)[0])
-        self.assertEqual(501, self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, oidc_cookie)[0])
+        self.assertEqual(502, self.request(f"/api/v1/servers/{server_id}/discover", "POST", {}, oidc_cookie)[0])
         status, _, body = self.request("/api/v1/servers", "POST", {"name": "Fixture", "host": "fixture.local", "adapter": "fixture"}, self.admin_cookie)
         self.assertEqual(201, status)
         fixture_id = json.loads(body)["id"]

@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIServer, make_server
 import branding
+import exacq
 from scheduler import MonitoringSchedule
 
 DATA_DIR = Path(os.environ.get("CHM_DATA_DIR", "./data"))
@@ -107,6 +108,7 @@ def initialize():
             resource_id TEXT, created_at TEXT NOT NULL)""")
         db.execute("""CREATE TABLE IF NOT EXISTS servers (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, port INTEGER,
+            web_scheme TEXT NOT NULL DEFAULT 'http', web_port INTEGER NOT NULL DEFAULT 80,
             username TEXT NOT NULL DEFAULT '', password_ciphertext TEXT NOT NULL DEFAULT '',
             adapter TEXT NOT NULL, fixture_profile TEXT NOT NULL DEFAULT 'success', enabled INTEGER NOT NULL DEFAULT 1,
             defaults_json TEXT NOT NULL DEFAULT '{}', capabilities_json TEXT NOT NULL,
@@ -116,9 +118,20 @@ def initialize():
         db.execute("""CREATE TABLE IF NOT EXISTS cameras (
             id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
             remote_id TEXT NOT NULL, name TEXT NOT NULL, disappeared INTEGER NOT NULL DEFAULT 0,
+            parent_remote_id TEXT NOT NULL DEFAULT '', disabled INTEGER NOT NULL DEFAULT 0,
+            connection_state TEXT NOT NULL DEFAULT 'unknown', metadata_json TEXT NOT NULL DEFAULT '{}',
             settings_json TEXT NOT NULL DEFAULT '{}', overrides_json TEXT NOT NULL DEFAULT '{}', history_json TEXT NOT NULL DEFAULT '[]',
             discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(server_id, remote_id))""")
+        server_columns = {row["name"] for row in db.execute("PRAGMA table_info(servers)").fetchall()}
+        for name, declaration in (("web_scheme", "TEXT NOT NULL DEFAULT 'http'"), ("web_port", "INTEGER NOT NULL DEFAULT 80")):
+            if name not in server_columns:
+                db.execute(f"ALTER TABLE servers ADD COLUMN {name} {declaration}")
+        camera_columns = {row["name"] for row in db.execute("PRAGMA table_info(cameras)").fetchall()}
+        for name, declaration in (("parent_remote_id", "TEXT NOT NULL DEFAULT ''"), ("disabled", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("connection_state", "TEXT NOT NULL DEFAULT 'unknown'"), ("metadata_json", "TEXT NOT NULL DEFAULT '{}'")):
+            if name not in camera_columns:
+                db.execute(f"ALTER TABLE cameras ADD COLUMN {name} {declaration}")
         db.execute("""CREATE TABLE IF NOT EXISTS recording_check_state (
             camera_id TEXT PRIMARY KEY REFERENCES cameras(id) ON DELETE CASCADE,
             checked_at TEXT NOT NULL, result_json TEXT NOT NULL)""")
@@ -325,8 +338,13 @@ def queue_event_deliveries(db,event_id,event_type,created_at):
 
 def update_incident(db, entity_type, entity_id, server_id, check_type, health, reason, checked_at, evidence=None, actor=None):
     """Persist incident transitions. Unknown is deliberately non-actionable."""
-    if entity_type == "camera" and reason in ("server_unavailable", "server_outage", "server_timeout", "monitoring_stalled"):
-        update_incident(db, "server", server_id, server_id, "server", "failure", reason, checked_at,
+    if entity_type == "camera" and reason == "permission_denied":
+        update_incident(db, "server", server_id, server_id, "server", "failure", "authentication_failed", checked_at,
+                        {"detail": "ExacqVision rejected the configured credentials or account permissions."}, actor)
+        return
+    if entity_type == "camera" and reason in ("server_unavailable", "server_outage", "server_timeout", "recorder_unavailable", "timeout", "monitoring_stalled"):
+        server_reason = "server_timeout" if reason in ("timeout", "server_timeout") else "server_unavailable"
+        update_incident(db, "server", server_id, server_id, "server", "failure", server_reason, checked_at,
                         {"detail": "Recorder access failed; camera health is not inferred from this result."}, actor)
         return
     if entity_type == "camera" and health in ("healthy", "warning", "failure"):
@@ -437,7 +455,7 @@ def reevaluate_latest_health(db, entity_type, entity_id, at, actor="maintenance"
         if not row:
             continue
         camera_id = row["id"]
-        camera = db.execute("SELECT server_id FROM cameras WHERE id=?", (camera_id,)).fetchone()
+        camera = db.execute("SELECT server_id,settings_json FROM cameras WHERE id=?", (camera_id,)).fetchone()
         if not camera:
             continue
         states = db.execute("SELECT result_json,checked_at FROM recording_check_state WHERE camera_id=?", (camera_id,)).fetchone()
@@ -624,13 +642,25 @@ def webhook_worker():
 
 
 def empty_capabilities():
-    why = "Not tested against this configured server. Confirm the installed version, enabled Web Service/API, account permissions, and playback interfaces before implementation can verify this capability."
+    why = "Not yet exercised against this recorder."
     return {key: {"status": "untested", "detail": why} for key in
-            ("camera_discovery", "live_delivery", "recording_search", "recorded_playback")}
+            ("web_service", "camera_discovery", "live_delivery", "recording_search", "recorded_playback")}
+
+
+def update_server_capability(server_id, name, status, detail):
+    with connect_db() as db:
+        row = db.execute("SELECT capabilities_json FROM servers WHERE id=?", (server_id,)).fetchone()
+        if not row:
+            return
+        capabilities = json.loads(row["capabilities_json"])
+        capabilities[name] = {"status": status, "detail": detail[:500]}
+        db.execute("UPDATE servers SET capabilities_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                   (json.dumps(capabilities), server_id))
 
 
 def default_camera_settings():
-    return {"live_interval_minutes": 5, "recording_interval_minutes": 60, "recording_lookback_hours": 24}
+    return {"live_interval_minutes": 5, "recording_interval_minutes": 60, "recording_lookback_hours": 24,
+            "recording_expected": True}
 
 
 def validate_camera_settings(value):
@@ -642,14 +672,22 @@ def validate_camera_settings(value):
         if type(candidate) is not int or not minimum <= candidate <= maximum:
             return None
         settings[key] = candidate
+    expected = value.get("recording_expected", True)
+    if type(expected) is not bool:
+        return None
+    settings["recording_expected"] = expected
     return settings
 
 
 def validate_camera_overrides(value):
-    if not isinstance(value, dict) or not set(value).issubset({"live_interval_minutes", "recording_interval_minutes", "recording_lookback_hours"}):
+    if not isinstance(value, dict) or not set(value).issubset({"live_interval_minutes", "recording_interval_minutes", "recording_lookback_hours", "recording_expected"}):
         return None
     ranges = {"live_interval_minutes": (1, 1440), "recording_interval_minutes": (1, 1440), "recording_lookback_hours": (1, 720)}
     for key, candidate in value.items():
+        if key == "recording_expected":
+            if type(candidate) is not bool:
+                return None
+            continue
         minimum, maximum = ranges[key]
         if type(candidate) is not int or not minimum <= candidate <= maximum:
             return None
@@ -659,6 +697,7 @@ def validate_camera_overrides(value):
 def server_public(row):
     item = dict(row)
     item["credentials_configured"] = bool(item.pop("password_ciphertext", ""))
+    item["username_configured"] = bool(item.pop("username", ""))
     item["enabled"] = bool(item["enabled"])
     item["capabilities"] = json.loads(item.pop("capabilities_json"))
     item.pop("fixture_profile", None)
@@ -670,8 +709,10 @@ def server_public(row):
 def camera_public(row):
     item = dict(row)
     item["disappeared"] = bool(item["disappeared"])
+    item["disabled"] = bool(item.get("disabled", 0))
+    item["metadata"] = json.loads(item.pop("metadata_json", "{}"))
     item["overrides"] = json.loads(item.pop("overrides_json"))
-    item["settings"] = json.loads(item.pop("settings_json"))
+    item["settings"] = {**default_camera_settings(), **json.loads(item.pop("settings_json"))}
     item["history"] = json.loads(item.pop("history_json"))
     item["live_status"] = {"health": "unknown", "state": "not_checked", "checked_at": None, "last_success_at": None}
     try:
@@ -713,8 +754,12 @@ def camera_public(row):
                 status["state"] = "unknown"
     item["live_status"].setdefault("current_health", item["live_status"].get("health", "unknown"))
     item["recording_status"].setdefault("current_health", item["recording_status"].get("health", "unknown"))
-    item["capabilities"] = {"live_delivery": {"status": "untested", "detail": "Live retrieval and video decoding are not implemented in this release."},
-                            "recording_search": {"status": "untested", "detail": "Recording search and playback decoding are not implemented in this release."}}
+    try:
+        with connect_db() as db:
+            server = db.execute("SELECT adapter,capabilities_json FROM servers WHERE id=?", (item["server_id"],)).fetchone()
+        item["capabilities"] = json.loads(server["capabilities_json"]) if server else empty_capabilities()
+    except (sqlite3.Error, TypeError):
+        item["capabilities"] = empty_capabilities()
     return item
 
 
@@ -736,7 +781,7 @@ def mark_monitoring_job(camera_id, check_type, job_id):
 def persist_scheduled_result(camera_id, check_type, job):
     completed_at = job.get("completed_at") or utc_now()
     with connect_db() as db:
-        camera = db.execute("SELECT server_id FROM cameras WHERE id=?", (camera_id,)).fetchone()
+        camera = db.execute("SELECT server_id,settings_json,overrides_json FROM cameras WHERE id=?", (camera_id,)).fetchone()
         if not camera:
             return
         server_id = camera["server_id"]
@@ -748,8 +793,14 @@ def persist_scheduled_result(camera_id, check_type, job):
             last_success = (result or {}).get("last_success_at") or last_success
             db.execute("INSERT INTO monitoring_check_state(camera_id,check_type,current_state,last_success_at) VALUES(?,?,?,?) ON CONFLICT(camera_id,check_type) DO UPDATE SET current_state=excluded.current_state,current_job_id=NULL,last_success_at=COALESCE(excluded.last_success_at,monitoring_check_state.last_success_at)",
                        (camera_id, check_type, health, last_success))
-            update_incident(db, "camera", camera_id, server_id, check_type, health,
-                            (result or {}).get("reason"), (result or {}).get("checked_at") or completed_at,
+            alert_health = health
+            alert_reason = (result or {}).get("reason")
+            effective_recording_expected = json.loads(camera["settings_json"]).get("recording_expected", True)
+            effective_recording_expected = json.loads(camera["overrides_json"]).get("recording_expected", effective_recording_expected)
+            if alert_reason == "no_recent_recording" and not effective_recording_expected:
+                alert_health, alert_reason = "healthy", "recording_expectation_disabled"
+            update_incident(db, "camera", camera_id, server_id, check_type, alert_health,
+                            alert_reason, (result or {}).get("checked_at") or completed_at,
                             (result or {}).get("evidence"))
         else:
             is_success = job.get("status") == "succeeded"
@@ -758,18 +809,24 @@ def persist_scheduled_result(camera_id, check_type, job):
             confirmation_retry = bool(job.get("confirmation_retry"))
             pending_due = None if is_success or confirmation_retry or not job.get("error") else monitoring_now() + 30
             error_code = ((job.get("error") or {}).get("code") or "check_failed")
-            confirmed_decode_failure = bool(confirmation_retry and not is_success and error_code == "decode_failed")
-            health = "healthy" if is_success else ("failure" if confirmed_decode_failure else "unknown")
+            confirmed_live_failure = bool(confirmation_retry and not is_success and error_code in ("decode_failed", "video_unavailable", "stale_video"))
+            health = "healthy" if is_success else ("failure" if confirmed_live_failure else "unknown")
             live_result = {"health": health, "reason": None if is_success else ((job.get("error") or {}).get("code") or "check_failed"),
                            "checked_at": completed_at, "last_success_at": last_success,
-                           "detail": "Fixture decode succeeded; this does not verify Exacq." if is_success else "Live check failed; awaiting a 30-second confirmation attempt." if pending_due else "The live check failed twice."}
+                           "freshness_verified": (job.get("result") or {}).get("freshness_verified"),
+                           "frames_decoded": (job.get("result") or {}).get("frames_decoded"),
+                           "detail": ((job.get("result") or {}).get("detail") if is_success else
+                                      "Live retrieval or decode failed; awaiting a 30-second confirmation attempt." if pending_due else
+                                      "Live retrieval or decode failed twice.")}
             db.execute("INSERT INTO live_check_state(camera_id,checked_at,result_json,last_success_at,confirmation_due_at) VALUES(?,?,?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json,last_success_at=excluded.last_success_at,confirmation_due_at=excluded.confirmation_due_at",
                        (camera_id, completed_at, json.dumps(live_result), last_success, pending_due))
             db.execute("INSERT INTO monitoring_check_state(camera_id,check_type,current_state,last_success_at) VALUES(?,?,?,?) ON CONFLICT(camera_id,check_type) DO UPDATE SET current_state=excluded.current_state,current_job_id=NULL,last_success_at=COALESCE(excluded.last_success_at,monitoring_check_state.last_success_at)",
                        (camera_id, check_type, "pending_confirmation" if pending_due else health, last_success))
             update_incident(db, "camera", camera_id, server_id, check_type, health,
                             None if is_success else error_code, completed_at,
-                            {"detail": live_result["detail"], "sample_timestamp": (job.get("result") or {}).get("sample_timestamp")})
+                            {"detail": live_result["detail"], "sample_timestamp": (job.get("result") or {}).get("sample_timestamp"),
+                             "freshness_verified": (job.get("result") or {}).get("freshness_verified"),
+                             "frames_decoded": (job.get("result") or {}).get("frames_decoded")})
         prune_history(db)
         if job.get("completed_at"):
             cam=db.execute("SELECT c.name,c.remote_id,c.server_id,s.name AS server_name FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.id=?",(camera_id,)).fetchone()
@@ -779,6 +836,24 @@ def persist_scheduled_result(camera_id, check_type, job):
                     "camera_name":cam["name"],"camera_remote_id":cam["remote_id"],"server_id":server_id,
                     "server_name":cam["server_name"],"status":job.get("status"),"completed_at":job.get("completed_at"),
                     "reason":(job.get("error") or {}).get("code") or result.get("reason")})
+    with connect_db() as db:
+        adapter_row = db.execute("SELECT adapter FROM servers WHERE id=?", (server_id,)).fetchone()
+    if adapter_row and adapter_row["adapter"] == "exacq":
+        if check_type == "live":
+            if job.get("status") == "succeeded":
+                update_server_capability(server_id, "live_delivery", "verified", "Live JPEG samples were retrieved and decoded. Source capture time is unavailable, so freshness is not independently verified.")
+            elif (job.get("error") or {}).get("code") in ("video_unavailable", "decode_failed"):
+                update_server_capability(server_id, "live_delivery", "failed", "Live video retrieval or decoding failed for a camera sample.")
+        else:
+            result = job.get("result") or {}
+            if result.get("health") == "warning" and result.get("reason") == "no_recent_recording":
+                update_server_capability(server_id, "recording_search", "verified", "Recording search completed successfully; no footage was present in the requested lookback window.")
+            elif result.get("health") == "healthy":
+                update_server_capability(server_id, "recording_search", "verified", "Recording search returned one or more footage intervals.")
+                update_server_capability(server_id, "recorded_playback", "verified", "A frame from the newest recording was retrieved and decoded.")
+            elif result.get("reason") in ("decode_failed", "video_unavailable"):
+                update_server_capability(server_id, "recording_search", "verified", "Recording search returned footage intervals.")
+                update_server_capability(server_id, "recorded_playback", "failed", "The newest recording sample could not be retrieved or decoded.")
     if MONITORING_SCHEDULE is not None and job.get("scheduled"):
         MONITORING_SCHEDULE.complete(camera_id, check_type)
 
@@ -793,7 +868,7 @@ def start_recording_check(camera, server, scheduled=False):
             return None, active, "duplicate"
         if len(RECORDING_CHECKS) >= 1000:
             return None, None, "capacity"
-        if server["adapter"] != "fixture":
+        if server["adapter"] not in ("fixture", "exacq"):
             return None, None, "integration_unverified"
         if not RECORDING_CHECK_SLOTS.acquire(blocking=False):
             return None, None, "capacity"
@@ -828,51 +903,63 @@ def run_recording_check(job_id, camera, server, lookback_hours):
             previous = db.execute("SELECT result_json FROM recording_check_state WHERE camera_id=?", (camera["id"],)).fetchone()
         previous_result = json.loads(previous["result_json"]) if previous else {}
         prior_success = previous_result.get("last_success_at")
-        if profile == "recording_permission_error":
-            result = {"health": "unknown", "reason": "permission_denied", "checked_at": checked_at,
-                      "last_success_at": prior_success, "newest_recording_at": None, "decoded": False,
-                      "evidence": {"detail": "Fixture search returned permission denied; no camera failure is inferred."}}
-        elif profile == "recording_search_error":
-            result = {"health": "unknown", "reason": "connector_unavailable", "checked_at": checked_at,
-                      "last_success_at": prior_success, "newest_recording_at": None, "decoded": False,
-                      "evidence": {"detail": "Fixture recording search is unavailable."}}
-        elif profile == "server_unavailable":
-            result = {"health": "unknown", "reason": "server_unavailable", "checked_at": checked_at,
-                      "last_success_at": prior_success, "newest_recording_at": None, "decoded": False,
-                      "evidence": {"detail": "Fixture simulates recorder server unavailability; camera health is not inferred."}}
+        if server["adapter"] == "exacq":
+            try:
+                password = credential_cipher().decrypt(server["password_ciphertext"].encode()).decode() if server["password_ciphertext"] else ""
+                result = exacq.ExacqClient(server, server["username"], password).check_recording(camera["remote_id"], lookback_hours)
+                result.update({"checked_at": checked_at, "last_success_at": checked_at if result.get("health") == "healthy" else prior_success})
+            except exacq.ExacqError as error:
+                media_failed = error.code in ("decode_failed", "video_unavailable")
+                result = {"health": "failure" if media_failed else "unknown", "reason": error.code,
+                          "checked_at": checked_at, "last_success_at": prior_success,
+                          "newest_recording_at": None, "decoded": False,
+                          "evidence": {"detail": error.safe_message}}
         else:
-            recordings = []
-            if profile not in ("recording_none",):
-                if profile == "recording_boundary":
-                    ages = [("recording-window-boundary.mp4", lookback_hours * 3600), ("recording-outside-window.mp4", lookback_hours * 3600 + 1)]
-                else:
-                    ages = [("recording-older.mp4", 4 * 3600), ("recording-newest.mp4", 3600)]
-                for name, age in ages:
-                    timestamp_epoch = checked_epoch - age
-                    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp_epoch))
-                    if checked_epoch - timestamp_epoch <= lookback_hours * 3600:
-                        recordings.append({"name": name, "timestamp": timestamp, "epoch": timestamp_epoch})
-            if not recordings:
-                result = {"health": "warning", "reason": "no_recent_recording", "checked_at": checked_at,
+            if profile == "recording_permission_error":
+                result = {"health": "unknown", "reason": "permission_denied", "checked_at": checked_at,
                           "last_success_at": prior_success, "newest_recording_at": None, "decoded": False,
-                          "evidence": {"detail": f"No motion recording was found within the previous {lookback_hours} hours."}}
+                          "evidence": {"detail": "Fixture search returned permission denied; no camera failure is inferred."}}
+            elif profile == "recording_search_error":
+                result = {"health": "unknown", "reason": "connector_unavailable", "checked_at": checked_at,
+                          "last_success_at": prior_success, "newest_recording_at": None, "decoded": False,
+                          "evidence": {"detail": "Fixture recording search is unavailable."}}
+            elif profile == "server_unavailable":
+                result = {"health": "unknown", "reason": "server_unavailable", "checked_at": checked_at,
+                          "last_success_at": prior_success, "newest_recording_at": None, "decoded": False,
+                          "evidence": {"detail": "Fixture simulates recorder server unavailability; camera health is not inferred."}}
             else:
-                newest = max(recordings, key=lambda recording: recording["epoch"])
-                content = b"invalid recording bytes" if profile == "recording_invalid_media" else (Path(__file__).parent / "tests" / "fixtures" / "live-sample.mp4").read_bytes()
-                with tempfile.NamedTemporaryFile(prefix="chm-recording-", suffix=".mp4", delete=False) as sample:
-                    temp_path = sample.name
-                    sample.write(content)
-                process = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-i", temp_path,
-                                           "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-"],
-                                          capture_output=True, text=True, timeout=LIVE_CHECK_TIMEOUT, check=False)
-                if process.returncode != 0:
-                    result = {"health": "failure", "reason": "decode_failed", "checked_at": checked_at,
-                              "last_success_at": prior_success, "newest_recording_at": newest["timestamp"], "decoded": False,
-                              "evidence": {"sample_name": newest["name"], "detail": "The newest recording sample could not be decoded."}}
+                recordings = []
+                if profile not in ("recording_none",):
+                    if profile == "recording_boundary":
+                        ages = [("recording-window-boundary.mp4", lookback_hours * 3600), ("recording-outside-window.mp4", lookback_hours * 3600 + 1)]
+                    else:
+                        ages = [("recording-older.mp4", 4 * 3600), ("recording-newest.mp4", 3600)]
+                    for name, age in ages:
+                        timestamp_epoch = checked_epoch - age
+                        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp_epoch))
+                        if checked_epoch - timestamp_epoch <= lookback_hours * 3600:
+                            recordings.append({"name": name, "timestamp": timestamp, "epoch": timestamp_epoch})
+                if not recordings:
+                    result = {"health": "warning", "reason": "no_recent_recording", "checked_at": checked_at,
+                              "last_success_at": prior_success, "newest_recording_at": None, "decoded": False,
+                              "evidence": {"detail": f"No motion recording was found within the previous {lookback_hours} hours."}}
                 else:
-                    result = {"health": "healthy", "reason": None, "checked_at": checked_at,
-                              "last_success_at": checked_at, "newest_recording_at": newest["timestamp"], "decoded": True,
-                              "evidence": {"sample_name": newest["name"], "decoder": "ffmpeg", "detail": "Fixture sample decoded; this does not verify Exacq compatibility."}}
+                    newest = max(recordings, key=lambda recording: recording["epoch"])
+                    content = b"invalid recording bytes" if profile == "recording_invalid_media" else (Path(__file__).parent / "tests" / "fixtures" / "live-sample.mp4").read_bytes()
+                    with tempfile.NamedTemporaryFile(prefix="chm-recording-", suffix=".mp4", delete=False) as sample:
+                        temp_path = sample.name
+                        sample.write(content)
+                    process = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-i", temp_path,
+                                               "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-"],
+                                              capture_output=True, text=True, timeout=LIVE_CHECK_TIMEOUT, check=False)
+                    if process.returncode != 0:
+                        result = {"health": "failure", "reason": "decode_failed", "checked_at": checked_at,
+                                  "last_success_at": prior_success, "newest_recording_at": newest["timestamp"], "decoded": False,
+                                  "evidence": {"sample_name": newest["name"], "detail": "The newest recording sample could not be decoded."}}
+                    else:
+                        result = {"health": "healthy", "reason": None, "checked_at": checked_at,
+                                  "last_success_at": checked_at, "newest_recording_at": newest["timestamp"], "decoded": True,
+                                  "evidence": {"sample_name": newest["name"], "decoder": "ffmpeg", "detail": "Fixture sample decoded; this does not verify Exacq compatibility."}}
         with connect_db() as db:
             db.execute("INSERT INTO recording_check_state(camera_id,checked_at,result_json) VALUES(?,?,?) ON CONFLICT(camera_id) DO UPDATE SET checked_at=excluded.checked_at,result_json=excluded.result_json",
                        (camera["id"], result["checked_at"], json.dumps(result)))
@@ -943,6 +1030,14 @@ def run_live_check(job_id, camera, server):
     temp_path = None
     process = None
     try:
+        if server["adapter"] == "exacq":
+            password = credential_cipher().decrypt(server["password_ciphertext"].encode()).decode() if server["password_ciphertext"] else ""
+            result = exacq.ExacqClient(server, server["username"], password, timeout=LIVE_CHECK_TIMEOUT).check_live(camera["remote_id"])
+            with LIVE_CHECK_LOCK:
+                if job["cancel_event"].is_set():
+                    raise InterruptedError("cancelled")
+                job.update(status="succeeded", result=result, completed_at=utc_now())
+            return
         if server["adapter"] != "fixture":
             raise RuntimeError("integration_unverified")
         if server["fixture_profile"] == "live_timeout":
@@ -1004,6 +1099,9 @@ def run_live_check(job_id, camera, server):
     except InterruptedError:
         with LIVE_CHECK_LOCK:
             job.update(status="cancelled", completed_at=utc_now())
+    except exacq.ExacqError as error:
+        with LIVE_CHECK_LOCK:
+            job.update(status="failed", error={"code": error.code, "message": error.safe_message}, completed_at=utc_now())
     except TimeoutError as error:
         with LIVE_CHECK_LOCK:
             job.update(status="failed", error={"code": "timeout", "message": str(error)}, completed_at=utc_now())
@@ -1049,7 +1147,7 @@ def start_live_check(camera, server, scheduled=False, confirmation_retry=False):
             return None, active, "duplicate"
         if len(LIVE_CHECKS) >= 1000:
             return None, None, "capacity"
-        if server["adapter"] != "fixture":
+        if server["adapter"] not in ("fixture", "exacq"):
             return None, None, "integration_unverified"
         if not LIVE_CHECK_SLOTS.acquire(blocking=False):
             return None, None, "capacity"
@@ -1072,11 +1170,14 @@ def create_server(db, data):
     adapter, port = data.get("adapter", "exacq"), data.get("port")
     username, password = data.get("username", ""), data.get("password", "")
     fixture_profile = data.get("fixture_profile", "success")
+    web_scheme = data.get("web_scheme", "http")
+    web_port = data.get("web_port", 443 if web_scheme == "https" else 80)
     defaults = validate_camera_settings(data.get("defaults", default_camera_settings()))
     if (not isinstance(name, str) or not name.strip() or len(name.strip()) > 100
             or not isinstance(host, str) or not host.strip() or len(host.strip()) > 253
             or any(c.isspace() for c in host.strip()) or "://" in host
             or (port is not None and (type(port) is not int or not 1 <= port <= 65535))
+            or web_scheme not in ("http", "https") or type(web_port) is not int or not 1 <= web_port <= 65535
             or adapter not in ("exacq", "fixture")
             or fixture_profile not in ("success", "discovery_error", "no_cameras", "capability_error", "invalid_media", "live_slow", "live_timeout", "live_flaky", "recording_none", "recording_success", "recording_invalid_media", "recording_permission_error", "recording_search_error", "recording_boundary", "server_unavailable")
             or not isinstance(username, str) or not isinstance(password, str) or defaults is None):
@@ -1088,8 +1189,8 @@ def create_server(db, data):
     if adapter == "fixture":
         capabilities["camera_discovery"] = {"status": "untested", "detail": "Fixture discovery has not run."}
     sid = str(uuid.uuid4())
-    db.execute("""INSERT INTO servers(id,name,host,port,username,password_ciphertext,adapter,fixture_profile,defaults_json,capabilities_json)
-        VALUES(?,?,?,?,?,?,?,?,?,?)""", (sid, name.strip(), host.strip(), port, username, cipher, adapter,
+    db.execute("""INSERT INTO servers(id,name,host,port,web_scheme,web_port,username,password_ciphertext,adapter,fixture_profile,defaults_json,capabilities_json)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (sid, name.strip(), host.strip(), port, web_scheme, web_port, username, cipher, adapter,
         fixture_profile if adapter == "fixture" else "success", json.dumps(defaults), json.dumps(capabilities)))
     return sid
 
@@ -1097,14 +1198,47 @@ def create_server(db, data):
 def discover_server(db, server):
     capabilities = json.loads(server["capabilities_json"])
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    if server["adapter"] != "fixture":
-        detail = ("Discovery is unverified and is not attempted. Exacq's public material identifies integration tools, "
-                  "but does not publish the installed server's API contract. Confirm version, Web Service/API setup, "
-                  "account permissions, licensing, and a supported discovery interface before enabling this adapter.")
-        capabilities["camera_discovery"] = {"status": "untested", "detail": detail}
-        db.execute("UPDATE servers SET capabilities_json=?, discovery_status='untested', discovery_detail=?, last_discovery_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+    if server["adapter"] == "exacq":
+        try:
+            password = credential_cipher().decrypt(server["password_ciphertext"].encode()).decode() if server["password_ciphertext"] else ""
+            result = exacq.ExacqClient(dict(server), server["username"], password).discover()
+        except exacq.ExacqError as error:
+            detail = error.safe_message
+            reason = "authentication_failed" if error.code == "permission_denied" else "server_unavailable" if error.code in ("recorder_unavailable", "timeout") else "discovery_failed"
+            update_incident(db, "server", server["id"], server["id"], "server", "failure", reason, now, {"detail": detail})
+            capabilities["camera_discovery"] = {"status": "failed", "detail": detail}
+            db.execute("UPDATE servers SET capabilities_json=?,discovery_status='failed',discovery_detail=?,last_discovery_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (json.dumps(capabilities), detail, now, server["id"]))
+            return {"error": error.code, "message": detail, "status": "failed"}, 502
+        except Exception:
+            detail = "ExacqVision discovery could not complete; credentials and server response details were not logged."
+            update_incident(db, "server", server["id"], server["id"], "server", "failure", "server_unavailable", now, {"detail": detail})
+            capabilities["camera_discovery"] = {"status": "failed", "detail": detail}
+            db.execute("UPDATE servers SET capabilities_json=?,discovery_status='failed',discovery_detail=?,last_discovery_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (json.dumps(capabilities), detail, now, server["id"]))
+            return {"error": "discovery_failed", "message": detail, "status": "failed"}, 502
+        remote_cameras = result["cameras"]
+        previous_ids = {row[0] for row in db.execute("SELECT remote_id FROM cameras WHERE server_id=?", (server["id"],)).fetchall()}
+        current_ids = {camera["remote_id"] for camera in remote_cameras}
+        db.execute("UPDATE cameras SET disappeared=1 WHERE server_id=?", (server["id"],))
+        for camera in remote_cameras:
+            db.execute("""INSERT INTO cameras(id,server_id,remote_id,name,parent_remote_id,disabled,connection_state,metadata_json,settings_json)
+                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(server_id,remote_id) DO UPDATE SET name=excluded.name,
+                parent_remote_id=excluded.parent_remote_id,disabled=excluded.disabled,connection_state=excluded.connection_state,
+                metadata_json=excluded.metadata_json,disappeared=0,last_seen_at=CURRENT_TIMESTAMP""",
+                (str(uuid.uuid4()), server["id"], camera["remote_id"], camera["name"], camera["parent_remote_id"],
+                 int(camera["disabled"]), camera["connection_state"], json.dumps(camera["metadata"]), server["defaults_json"]))
+        detail = f"ExacqVision Web Service returned {len(current_ids)} cameras; live and recording checks remain independently verified."
+        capabilities["camera_discovery"] = {"status": "verified", "detail": detail}
+        if result.get("version"):
+            capabilities["web_service"] = {"status": "verified", "detail": f"Authenticated ExacqVision server version {result['version']}."}
+        db.execute("UPDATE servers SET capabilities_json=?,discovery_status='verified',discovery_detail=?,last_discovery_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                    (json.dumps(capabilities), detail, now, server["id"]))
-        return {"error": "integration_unverified", "message": detail, "status": "untested"}, 501
+        update_incident(db, "server", server["id"], server["id"], "server", "healthy", "server_recovered", now, {})
+        return {"server_id": server["id"], "discovered": len(current_ids), "added": len(current_ids - previous_ids),
+                "disappeared": len(previous_ids - current_ids), "cameras": [dict(row) for row in db.execute(
+                    "SELECT id,remote_id,name,disappeared,disabled,connection_state FROM cameras WHERE server_id=? ORDER BY remote_id", (server["id"],)).fetchall()],
+                "capabilities": capabilities}, 200
     profile = server["fixture_profile"]
     if profile == "discovery_error":
         detail = "Fixture discovery failed: simulated recorder permission denied."
@@ -1331,10 +1465,11 @@ def openapi_document():
                 "BrandingImage": {"type": "object", "required": ["data"], "properties": {"data": {"type": "string", "contentEncoding": "base64", "description": "PNG or JPEG image data. Maximum 2 MiB and 2048px (favicon 512 KiB and 512px)."}}},
                 "ApiTokenCreate": {"type": "object", "required": ["name", "role", "scopes"], "properties": {"name": {"type": "string", "maxLength": 80}, "role": {"type": "string", "enum": ["operator", "administrator"]}, "scopes": {"type": "array", "uniqueItems": True, "items": {"type": "string", "enum": sorted(set.union(*API_SCOPES.values()))}}, "expires_at": {"type": ["string", "null"], "format": "date-time"}}},
                 "ApiTokenMetadata": {"type": "object", "required": ["id", "name", "role", "scopes", "created_at"], "properties": {"id": {"type": "integer"}, "name": {"type": "string"}, "role": {"type": "string"}, "scopes": {"type": "array", "items": {"type": "string"}}, "created_by": {"type": "string"}, "created_at": {"type": "string", "format": "date-time"}, "expires_at": {"type": ["string", "null"], "format": "date-time"}, "revoked_at": {"type": ["string", "null"], "format": "date-time"}}},
-                "CameraSettings": {"type": "object", "properties": {"live_interval_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 5}, "recording_interval_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 60}, "recording_lookback_hours": {"type": "integer", "minimum": 1, "maximum": 720, "default": 24}}},
-                "ServerInput": {"type": "object", "required": ["name", "host"], "properties": {"name": {"type": "string"}, "host": {"type": "string"}, "port": {"type": ["integer", "null"], "description": "Only specify after confirming the installed interface port."}, "username": {"type": "string"}, "password": {"type": "string", "format": "password", "description": "Write-only; blank on update retains stored credential."}, "defaults": {"$ref": "#/components/schemas/CameraSettings"}, "adapter": {"type": "string", "enum": ["exacq", "fixture"]}}},
-                "ServerUpdate": {"type": "object", "properties": {"name": {"type": "string"}, "host": {"type": "string"}, "port": {"type": ["integer", "null"]}, "username": {"type": "string"}, "password": {"type": "string", "format": "password", "description": "Write-only; blank retains stored credential."}, "enabled": {"type": "boolean"}, "defaults": {"$ref": "#/components/schemas/CameraSettings"}}},
-                "Server": {"type": "object", "properties": {"id": {"type": "string", "format": "uuid"}, "name": {"type": "string"}, "host": {"type": "string"}, "port": {"type": ["integer", "null"]}, "credentials_configured": {"type": "boolean"}, "capabilities": {"type": "object"}, "discovery_status": {"type": "string"}, "last_discovery_at": {"type": ["string", "null"]}}},
+                "CameraSettings": {"type": "object", "properties": {"live_interval_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 5}, "recording_interval_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 60}, "recording_lookback_hours": {"type": "integer", "minimum": 1, "maximum": 720, "default": 24}, "recording_expected": {"type": "boolean", "default": True, "description": "When false, a no_recent_recording result remains visible but does not open a camera incident or alert."}}},
+                "Camera": {"type": "object", "properties": {"id": {"type": "string", "format": "uuid"}, "server_id": {"type": "string"}, "remote_id": {"type": "string"}, "name": {"type": "string"}, "parent_remote_id": {"type": "string"}, "disappeared": {"type": "boolean"}, "disabled": {"type": "boolean"}, "connection_state": {"type": "string", "enum": ["unknown", "connected", "disconnected", "disabled"]}, "metadata": {"type": "object"}, "settings": {"$ref": "#/components/schemas/CameraSettings"}, "overrides": {"type": "object"}, "live_status": {"type": "object"}, "recording_status": {"type": "object"}}},
+                "ServerInput": {"type": "object", "required": ["name", "host"], "properties": {"name": {"type": "string"}, "host": {"type": "string"}, "port": {"type": ["integer", "null"], "description": "Optional native recorder port; the Web Service uses web_scheme and web_port."}, "web_scheme": {"type": "string", "enum": ["http", "https"], "default": "http"}, "web_port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 80}, "username": {"type": "string"}, "password": {"type": "string", "format": "password", "description": "Write-only; blank on update retains stored credential."}, "defaults": {"$ref": "#/components/schemas/CameraSettings"}, "adapter": {"type": "string", "enum": ["exacq", "fixture"]}}},
+                "ServerUpdate": {"type": "object", "properties": {"name": {"type": "string"}, "host": {"type": "string"}, "port": {"type": ["integer", "null"]}, "web_scheme": {"type": "string", "enum": ["http", "https"]}, "web_port": {"type": "integer", "minimum": 1, "maximum": 65535}, "username": {"type": "string"}, "password": {"type": "string", "format": "password", "description": "Write-only; blank retains stored credential."}, "enabled": {"type": "boolean"}, "defaults": {"$ref": "#/components/schemas/CameraSettings"}}},
+                "Server": {"type": "object", "properties": {"id": {"type": "string", "format": "uuid"}, "name": {"type": "string"}, "host": {"type": "string"}, "port": {"type": ["integer", "null"]}, "web_scheme": {"type": "string", "enum": ["http", "https"]}, "web_port": {"type": "integer"}, "credentials_configured": {"type": "boolean"}, "capabilities": {"type": "object"}, "discovery_status": {"type": "string"}, "last_discovery_at": {"type": ["string", "null"]}}},
                 "Capability": {"type": "object", "required": ["status", "detail"], "properties": {"status": {"type": "string", "enum": ["untested", "unknown", "unsupported", "failed", "verified"]}, "detail": {"type": "string"}}},
                 "LiveCheckJob": {"type": "object", "required": ["id", "camera_id", "server_id", "status", "created_at", "result", "error"], "properties": {"id": {"type": "string", "format": "uuid"}, "camera_id": {"type": "string"}, "server_id": {"type": "string"}, "status": {"type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled"]}, "created_at": {"type": "string", "format": "date-time"}, "started_at": {"type": ["string", "null"], "format": "date-time"}, "completed_at": {"type": ["string", "null"], "format": "date-time"}, "result": {"type": ["object", "null"], "properties": {"decoded": {"type": "boolean"}, "frames_decoded": {"type": "integer"}, "sample_timestamp": {"type": ["string", "null"], "description": "Wall-clock source capture timestamp, null when unavailable."}, "frame_timestamp": {"type": ["string", "null"], "description": "Container presentation timestamp; not wall-clock capture time."}, "sample_timestamp_source": {"type": "string"}, "decoder": {"type": "string"}, "detail": {"type": "string"}}}, "error": {"type": ["object", "null"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}},
                 "RecordingCheckJob": {"type": "object", "required": ["id", "camera_id", "server_id", "status", "lookback_hours", "result"], "properties": {"id": {"type": "string", "format": "uuid"}, "camera_id": {"type": "string"}, "server_id": {"type": "string"}, "status": {"type": "string", "enum": ["queued", "running", "completed"]}, "lookback_hours": {"type": "integer", "minimum": 1, "maximum": 720}, "created_at": {"type": "string", "format": "date-time"}, "started_at": {"type": ["string", "null"], "format": "date-time"}, "completed_at": {"type": ["string", "null"], "format": "date-time"}, "result": {"type": ["object", "null"], "properties": {"health": {"type": "string", "enum": ["healthy", "warning", "failure", "unknown"]}, "reason": {"type": ["string", "null"]}, "checked_at": {"type": "string", "format": "date-time"}, "last_success_at": {"type": ["string", "null"], "format": "date-time"}, "newest_recording_at": {"type": ["string", "null"], "format": "date-time"}, "decoded": {"type": "boolean"}, "evidence": {"type": "object"}}}, "error": {"type": ["object", "null"]}}},
@@ -1368,13 +1503,13 @@ def openapi_document():
             "/branding/assets/{asset}": {"parameters": [{"name": "asset", "in": "path", "required": True, "schema": {"type": "string", "enum": sorted(branding.ASSET_KEYS)}}], "get": {"summary": "Serve a validated branding image", "responses": {"200": {"description": "Inert PNG or JPEG image"}, "404": {"description": "No image configured"}}}, "put": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Upload a branding image (branding:write)", "requestBody": body("BrandingImage"), "responses": {"200": json_response("Image saved", {"type": "object", "properties": {"asset": {"type": "string"}, "url": {"type": "string"}}}), "400": {"description": "Invalid image, size, dimensions or format"}, "401": {"description": "Sign in required"}}}, "delete": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Remove a branding image (branding:write)", "responses": {"200": {"description": "Image removed"}, "401": {"description": "Sign in required"}}}},
             "/servers": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "List configured recorder servers (servers:read)", "responses": {"200": json_response("Servers with secrets redacted", {"type": "array", "items": {"$ref": "#/components/schemas/Server"}})}}, "post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Add a recorder connection (servers:write)", "requestBody": body("ServerInput"), "responses": {"201": json_response("Created", {"$ref": "#/components/schemas/Server"}), "400": {"description": "Invalid server configuration"}}}},
             "/servers/{server_id}": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Read a recorder connection (servers:read)", "responses": {"200": json_response("Server", {"$ref": "#/components/schemas/Server"})}}, "put": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Update a recorder connection (servers:write)", "requestBody": body("ServerUpdate"), "responses": {"200": json_response("Updated server", {"$ref": "#/components/schemas/Server"})}}, "delete": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Remove a recorder and inventory (servers:write)", "responses": {"204": {"description": "Removed"}}}},
-            "/servers/{server_id}/discover": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Refresh camera inventory (checks:run)", "responses": {"200": json_response("Discovery result", {"type": "object"}), "501": {"description": "Exacq interface contract unverified"}, "502": {"description": "Discovery failed"}}}},
-            "/servers/{server_id}/capabilities": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Read independent capability status (servers:read)", "responses": {"200": json_response("Capabilities", {"type": "object"})}}, "post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Probe capabilities (servers:write)", "responses": {"200": json_response("Capabilities", {"type": "object"})}}},
-            "/cameras": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "List persistent camera inventory (cameras:read)", "responses": {"200": json_response("Camera inventory", {"type": "array", "items": {"type": "object"}})}}},
-            "/cameras/{camera_id}/recording-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start an asynchronous recent recording search and sample decode (checks:run)", "responses": {"202": json_response("Queued recording check", {"$ref": "#/components/schemas/RecordingCheckJob"}), "409": {"description": "Camera unavailable or check already running"}, "429": {"description": "Check capacity reached"}, "501": {"description": "Exacq recording search/playback contract unverified"}}}},
-            "/servers/{server_id}/recording-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start checks for all present cameras on a server (checks:run)", "responses": {"202": json_response("Queued per-camera jobs", {"type": "object"}), "501": {"description": "Exacq recording search/playback contract unverified"}}}},
+            "/servers/{server_id}/discover": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Authenticate and refresh camera inventory using the configured Web Service (checks:run)", "responses": {"200": json_response("Discovery result", {"type": "object"}), "502": {"description": "Authentication, recorder access, or response failure"}}}},
+            "/servers/{server_id}/capabilities": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Read independent capability status (servers:read)", "responses": {"200": json_response("Capabilities", {"type": "object"})}}, "post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Test Web Service authentication and server status (servers:write)", "responses": {"200": json_response("Connection result and capabilities", {"type": "object"}), "502": {"description": "Connection or authentication failed"}}}},
+            "/cameras": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "List persistent camera inventory (cameras:read)", "responses": {"200": json_response("Camera inventory", {"type": "array", "items": {"$ref": "#/components/schemas/Camera"}})}}},
+            "/cameras/{camera_id}/recording-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start an asynchronous recent recording search and sample decode (checks:run)", "responses": {"202": json_response("Queued recording check", {"$ref": "#/components/schemas/RecordingCheckJob"}), "409": {"description": "Camera unavailable or check already running"}, "429": {"description": "Check capacity reached"}, "502": {"description": "ExacqVision connection or recording request failed"}}}},
+            "/servers/{server_id}/recording-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start checks for all present cameras on a server (checks:run)", "responses": {"202": json_response("Queued per-camera jobs", {"type": "object"}), "502": {"description": "ExacqVision connection or recording request failed"}}}},
             "/recording-checks/{job_id}": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Poll a recording-check result (health:read)", "responses": {"200": json_response("Recording-check state and evidence", {"$ref": "#/components/schemas/RecordingCheckJob"}), "404": {"description": "Check not found"}}}},
-            "/cameras/{camera_id}/live-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start an asynchronous live sample retrieval and decode check (checks:run)", "responses": {"202": json_response("Queued check", {"$ref": "#/components/schemas/LiveCheckJob"}), "404": {"description": "Camera not found"}, "409": {"description": "Camera unavailable or a check already running"}, "429": {"description": "Check capacity reached"}, "501": {"description": "Exacq interface contract unverified"}}}},
+            "/cameras/{camera_id}/live-check": {"post": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Start an asynchronous live sample retrieval and decode check (checks:run)", "responses": {"202": json_response("Queued check", {"$ref": "#/components/schemas/LiveCheckJob"}), "404": {"description": "Camera not found"}, "409": {"description": "Camera unavailable or a check already running"}, "429": {"description": "Check capacity reached"}, "502": {"description": "ExacqVision connection or live sample request failed"}}}},
             "/live-checks/{job_id}": {"get": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Poll a live-check result (health:read)", "responses": {"200": json_response("Live-check state and decode result", {"$ref": "#/components/schemas/LiveCheckJob"}), "404": {"description": "Check not found"}}}, "delete": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Cancel an active live check (checks:run)", "responses": {"202": json_response("Cancellation requested", {"$ref": "#/components/schemas/LiveCheckJob"}), "409": {"description": "Check is already terminal"}}}},
             "/cameras/{camera_id}": {"put": {"security": [{"sessionCookie": []}, {"bearerToken": []}], "summary": "Update camera overrides (cameras:write)", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"overrides": {"type": "object"}}}}}}, "responses": {"200": json_response("Updated camera", {"type": "object"})}}},
             "/webhook-events": {"get":{"security":[{"sessionCookie":[]},{"bearerToken":[]}],"summary":"List versioned webhook event types (webhooks:read)","responses":{"200":json_response("Event catalog",{"type":"object","properties":{"version":{"type":"integer"},"events":{"type":"array","items":{"type":"string"}}}})}}},
@@ -2005,10 +2140,8 @@ def app(environ, start_response):
                 if not camera:
                     return response(start_response, 404, {"error": "camera_not_found"})
                 server = db.execute("SELECT * FROM servers WHERE id=?", (camera["server_id"],)).fetchone()
-                if not server or not server["enabled"] or camera["disappeared"]:
+                if not server or not server["enabled"] or camera["disappeared"] or camera["disabled"]:
                     return response(start_response, 409, {"error": "camera_unavailable", "message": "The camera or its recorder is disabled or no longer present."})
-                if server["adapter"] != "fixture":
-                    return response(start_response, 501, {"error": "integration_unverified", "message": "Live sample retrieval cannot run until the installed ExacqVision interface contract is validated."})
                 job, active_id, error = start_live_check(dict(camera), dict(server))
             if error == "duplicate":
                 return response(start_response, 409, {"error": "check_already_running", "job_id": active_id})
@@ -2022,10 +2155,8 @@ def app(environ, start_response):
                 camera = db.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
                 if not camera: return response(start_response, 404, {"error": "camera_not_found"})
                 server = db.execute("SELECT * FROM servers WHERE id=?", (camera["server_id"],)).fetchone()
-                if not server or not server["enabled"] or camera["disappeared"]:
+                if not server or not server["enabled"] or camera["disappeared"] or camera["disabled"]:
                     return response(start_response, 409, {"error": "camera_unavailable", "message": "The camera or its recorder is disabled or no longer present."})
-                if server["adapter"] != "fixture":
-                    return response(start_response, 501, {"error": "integration_unverified", "message": "Recording search and recorded playback are unverified for the installed Exacq interface; no recorder request was attempted."})
                 job, active_id, error = start_recording_check(dict(camera), dict(server))
             if error == "duplicate": return response(start_response, 409, {"error": "check_already_running", "job_id": active_id})
             if error == "capacity": return response(start_response, 429, {"error": "check_capacity_reached", "message": "All recording-check worker slots are occupied. Retry later."})
@@ -2040,8 +2171,7 @@ def app(environ, start_response):
                 server = db.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()
                 if not server: return response(start_response, 404, {"error": "server_not_found"})
                 if not server["enabled"]: return response(start_response, 409, {"error": "server_disabled"})
-                if server["adapter"] != "fixture": return response(start_response, 501, {"error": "integration_unverified", "message": "Recording search and playback are unverified; no recorder request was attempted."})
-                cameras = db.execute("SELECT * FROM cameras WHERE server_id=? AND disappeared=0 ORDER BY remote_id", (server_id,)).fetchall()
+                cameras = db.execute("SELECT * FROM cameras WHERE server_id=? AND disappeared=0 AND disabled=0 ORDER BY remote_id", (server_id,)).fetchall()
             jobs = []
             for camera in cameras:
                 job, active_id, error = start_recording_check(dict(camera), dict(server))
@@ -2104,16 +2234,19 @@ def app(environ, start_response):
                     enabled = body.get("enabled", bool(existing["enabled"]))
                     profile = body.get("fixture_profile", existing["fixture_profile"])
                     defaults = validate_camera_settings(body.get("defaults", json.loads(existing["defaults_json"])))
+                    web_scheme = body.get("web_scheme", existing.get("web_scheme", "http"))
+                    web_port = body.get("web_port", existing.get("web_port", 80))
                     if (not isinstance(name, str) or not name.strip() or len(name.strip()) > 100
                             or not isinstance(host, str) or not host.strip() or len(host.strip()) > 253
                             or any(c.isspace() for c in host.strip()) or "://" in host
                             or (port is not None and (type(port) is not int or not 1 <= port <= 65535))
+                            or web_scheme not in ("http", "https") or type(web_port) is not int or not 1 <= web_port <= 65535
                             or not isinstance(username, str) or not isinstance(password, str) or not isinstance(enabled, bool)
                             or profile not in ("success", "discovery_error", "no_cameras", "capability_error", "invalid_media", "live_slow", "live_timeout", "live_flaky", "recording_none", "recording_success", "recording_invalid_media", "recording_permission_error", "recording_search_error", "recording_boundary", "server_unavailable") or defaults is None):
                         return response(start_response, 400, {"error": "invalid_server"})
                     cipher = credential_cipher().encrypt(password.encode()).decode() if password else existing["password_ciphertext"]
-                    db.execute("UPDATE servers SET name=?,host=?,port=?,username=?,password_ciphertext=?,enabled=?,fixture_profile=?,defaults_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                               (name.strip(), host.strip(), port, username, cipher, int(enabled), profile, json.dumps(defaults), server_id))
+                    db.execute("UPDATE servers SET name=?,host=?,port=?,web_scheme=?,web_port=?,username=?,password_ciphertext=?,enabled=?,fixture_profile=?,defaults_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                               (name.strip(), host.strip(), port, web_scheme, web_port, username, cipher, int(enabled), profile, json.dumps(defaults), server_id))
                     for camera_row in db.execute("SELECT id,overrides_json FROM cameras WHERE server_id=?", (server_id,)).fetchall():
                         overrides = json.loads(camera_row["overrides_json"])
                         db.execute("UPDATE cameras SET settings_json=? WHERE id=?", (json.dumps({**defaults, **overrides}), camera_row["id"]))
@@ -2139,6 +2272,20 @@ def app(environ, start_response):
                         capabilities["recording_search"] = {"status": "untested", "detail": "Fixture does not simulate recording search."}
                         capabilities["recorded_playback"] = {"status": "untested", "detail": "Fixture does not simulate recorded video decoding."}
                         db.execute("UPDATE servers SET capabilities_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(capabilities), server_id))
+                    elif method == "POST" and row["adapter"] == "exacq":
+                        try:
+                            password = credential_cipher().decrypt(row["password_ciphertext"].encode()).decode() if row["password_ciphertext"] else ""
+                            connection = exacq.ExacqClient(dict(row), row["username"], password).test_connection()
+                            version = connection.get("version") or "version not reported"
+                            capabilities["web_service"] = {"status": "verified", "detail": f"Authenticated Web Service; ExacqVision {version}."}
+                            db.execute("UPDATE servers SET capabilities_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(capabilities), server_id))
+                            audit(principal, "server.capabilities.probed", "server", server_id, db)
+                            return response(start_response, 200, {"server_id": server_id, "connection": {"status": "verified", "version": connection.get("version"), "server_status": connection.get("server_status")}, "capabilities": capabilities})
+                        except exacq.ExacqError as error:
+                            capabilities["web_service"] = {"status": "failed", "detail": error.safe_message}
+                            db.execute("UPDATE servers SET capabilities_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(capabilities), server_id))
+                            audit(principal, "server.capabilities.probed", "server", server_id, db)
+                            return response(start_response, 502, {"error": error.code, "message": error.safe_message, "capabilities": capabilities})
                     if method == "POST": audit(principal, "server.capabilities.probed", "server", server_id, db)
                     return response(start_response, 200, {"server_id": server_id, "capabilities": capabilities})
         if route == "dashboard" and method == "GET":
@@ -2211,7 +2358,7 @@ def periodic_monitoring_worker():
         return
     MONITORING_SCHEDULE = MonitoringSchedule(DB_PATH)
     with connect_db() as db:
-        rows = db.execute("SELECT c.id,c.settings_json FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.disappeared=0 AND s.enabled=1").fetchall()
+        rows = db.execute("SELECT c.id,c.settings_json FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.disappeared=0 AND c.disabled=0 AND s.enabled=1").fetchall()
     MONITORING_SCHEDULE.synchronize([{"id": row["id"], "settings": json.loads(row["settings_json"])} for row in rows], now=monitoring_now(), reset_missed=True)
     while True:
         now = monitoring_now()
@@ -2219,7 +2366,7 @@ def periodic_monitoring_worker():
         try:
             with connect_db() as db:
                 expire_maintenance(db, now)
-                cameras = db.execute("SELECT c.*,s.enabled AS server_enabled,s.adapter,s.fixture_profile FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.disappeared=0 AND s.enabled=1 AND NOT EXISTS (SELECT 1 FROM camera_exclusions e WHERE e.camera_id=c.id)").fetchall()
+                cameras = db.execute("SELECT c.*,s.enabled AS server_enabled,s.adapter,s.fixture_profile FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.disappeared=0 AND c.disabled=0 AND s.enabled=1 AND NOT EXISTS (SELECT 1 FROM camera_exclusions e WHERE e.camera_id=c.id)").fetchall()
                 by_id = {row["id"]: dict(row) for row in cameras}
                 confirmations = db.execute("SELECT camera_id FROM live_check_state WHERE confirmation_due_at IS NOT NULL AND confirmation_due_at<=?", (now,)).fetchall()
             MONITORING_SCHEDULE.synchronize([{"id": row["id"], "settings": json.loads(row["settings_json"])} for row in cameras], now=now)
@@ -2230,7 +2377,7 @@ def periodic_monitoring_worker():
                     continue
                 with connect_db() as db:
                     server = db.execute("SELECT * FROM servers WHERE id=?", (camera["server_id"],)).fetchone()
-                if not server or server["adapter"] != "fixture":
+                if not server or server["adapter"] not in ("fixture", "exacq"):
                     continue
                 start_live_check(camera, dict(server), scheduled=True, confirmation_retry=True)
             due = MONITORING_SCHEDULE.claim_due(now)
@@ -2243,12 +2390,7 @@ def periodic_monitoring_worker():
                 if not server:
                     continue
                 check_type = entry["check_type"]
-                if server["adapter"] != "fixture":
-                    # Keep installed Exacq integration explicitly unverified.
-                    state = "integration_unverified"
-                    with connect_db() as db:
-                        db.execute("INSERT INTO monitoring_check_state(camera_id,check_type,current_state,last_attempt_at) VALUES(?,?,?,?) ON CONFLICT(camera_id,check_type) DO UPDATE SET current_state=excluded.current_state,current_job_id=NULL,last_attempt_at=excluded.last_attempt_at",
-                                   (camera["id"], check_type, state, utc_now()))
+                if server["adapter"] not in ("fixture", "exacq"):
                     MONITORING_SCHEDULE.complete(camera["id"], check_type)
                     continue
                 if check_type == "live":
@@ -2264,7 +2406,7 @@ def periodic_monitoring_worker():
             try:
                 with connect_db() as db:
                     expire_maintenance(db, monitoring_now())
-                    rows = db.execute("SELECT c.id,c.settings_json FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.disappeared=0 AND s.enabled=1 AND NOT EXISTS (SELECT 1 FROM camera_exclusions e WHERE e.camera_id=c.id)").fetchall()
+                    rows = db.execute("SELECT c.id,c.settings_json FROM cameras c JOIN servers s ON s.id=c.server_id WHERE c.disappeared=0 AND c.disabled=0 AND s.enabled=1 AND NOT EXISTS (SELECT 1 FROM camera_exclusions e WHERE e.camera_id=c.id)").fetchall()
                 MONITORING_SCHEDULE.synchronize([{"id": row["id"], "settings": json.loads(row["settings_json"])} for row in rows], now=monitoring_now())
             except sqlite3.Error:
                 continue
