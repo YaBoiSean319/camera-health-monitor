@@ -22,6 +22,7 @@ class ExacqHandler(BaseHTTPRequestHandler):
     playback_counter = 0
     freeze_playback = False
     no_recordings = False
+    error_path_status = None
 
     def log_message(self, *_args):
         pass
@@ -48,6 +49,8 @@ class ExacqHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query.replace(";", "&"))
         self.requests_seen.append(("GET", parsed.path, query))
+        if self.error_path_status and parsed.path == "/search.web":
+            return self.send_error(self.error_path_status, "synthetic private response body")
         if parsed.path == "/config.web":
             return self.send_json({"success": True, "Cameras": [
                 {"id": 101, "name": "Lobby", "parentId": 5, "disabled": 0, "state": 0,
@@ -111,6 +114,7 @@ class ExacqClientTests(unittest.TestCase):
         ExacqHandler.playback_counter = 0
         ExacqHandler.freeze_playback = False
         ExacqHandler.no_recordings = False
+        ExacqHandler.error_path_status = None
         self.server = ExacqFixtureServer(("127.0.0.1", 0), ExacqHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -191,6 +195,25 @@ class ExacqClientTests(unittest.TestCase):
         self.assertEqual("permission_denied", raised.exception.code)
         self.assertNotIn("synthetic-password", raised.exception.safe_message)
         self.assertNotIn("Login failed", raised.exception.safe_message)
+
+    def test_http_failures_include_safe_stage_and_status_without_response_details(self):
+        client = self.client()
+        trace = []
+        client.diagnostic_callback = lambda *fields: trace.append(fields)
+        with self.assertRaises(exacq.ExacqError) as raised:
+            client._request("/missing.web")
+        self.assertEqual(404, raised.exception.http_status)
+        self.assertEqual("recorder_request", raised.exception.stage)
+        self.assertEqual("failed", trace[-1][1])
+        self.assertEqual(404, trace[-1][3])
+        self.assertNotIn("404", raised.exception.safe_message)
+
+        ExacqHandler.error_path_status = 500
+        with self.assertRaises(exacq.ExacqError) as server_error:
+            client._request("/search.web")
+        self.assertEqual(500, server_error.exception.http_status)
+        self.assertEqual("search", server_error.exception.stage)
+        self.assertNotIn("private response body", server_error.exception.safe_message)
 
 
 if __name__ == "__main__":

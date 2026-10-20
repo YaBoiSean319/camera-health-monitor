@@ -20,6 +20,11 @@ services:
     environment:
       CHM_COOKIE_SECURE: "false" # Set true when HTTPS terminates at a reverse proxy.
       CHM_PUBLIC_URL: "" # Set to the external HTTPS origin when enabling OIDC behind a proxy.
+      CHM_DIAGNOSTICS_ENABLED: "false" # Temporarily set true for metadata-only recorder action traces.
+      CHM_DIAGNOSTIC_MAX_EVENTS: "5000" # Bounded by the application to 100-50000 rows.
+      CHM_DIAGNOSTIC_RETENTION_DAYS: "7" # Bounded by the application to 1-90 days.
+      CHM_RECORDING_BATCH_RETRY_SECONDS: "1"
+      CHM_RECORDING_BATCH_BUSY_TIMEOUT_SECONDS: "120"
     volumes:
       - camera-health-data:/data
     healthcheck:

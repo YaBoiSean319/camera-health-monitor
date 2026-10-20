@@ -25,11 +25,16 @@ MAX_SEARCH_WAIT_SECONDS = 15
 
 
 class ExacqError(Exception):
-    def __init__(self, code: str, message: str, search_verified: bool = False):
+    def __init__(self, code: str, message: str, search_verified: bool = False, *,
+                 stage: str | None = None, http_status: int | None = None,
+                 transport_category: str | None = None):
         super().__init__(message)
         self.code = code
         self.safe_message = message
         self.search_verified = search_verified
+        self.stage = stage
+        self.http_status = http_status
+        self.transport_category = transport_category
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -40,13 +45,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class ExacqClient:
     """One short-lived authenticated session; session IDs never leave this module."""
 
-    def __init__(self, server, username, password, timeout=TIMEOUT_SECONDS):
+    def __init__(self, server, username, password, timeout=TIMEOUT_SECONDS, diagnostic_callback=None):
         self.host = server["host"].strip().strip("[]")
         self.scheme = server.get("web_scheme", "http")
         self.port = server.get("web_port") or (443 if self.scheme == "https" else 80)
         self.username = username
         self.password = password
         self.timeout = timeout
+        self.diagnostic_callback = diagnostic_callback
         self.session_id = None
         self.opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
@@ -57,6 +63,9 @@ class ExacqClient:
         return f"{self.scheme}://{host}" + (f":{self.port}" if self.port != default_port else "")
 
     def _request(self, path, params=None, data=None, expected=None, retry_auth=True):
+        started = time.monotonic()
+        stage = self._request_stage(path, params or {})
+        self._last_request_stage = stage
         params = dict(params or {})
         url = self.origin + path
         if params:
@@ -85,26 +94,53 @@ class ExacqClient:
                     self.login()
                     params["s"] = self.session_id
                     return self._request(path, params, data, expected, retry_auth=False)
-                raise ExacqError("permission_denied", "ExacqVision rejected authentication or access.") from None
+                self._emit_diagnostic(stage, "failed", started, status, "permission_denied")
+                raise ExacqError("permission_denied", "ExacqVision rejected authentication or access.", stage=stage, http_status=status) from None
             if status in (301, 302, 303, 307, 308):
-                raise ExacqError("unsupported_response", "ExacqVision redirected the request; redirects are not followed.") from None
-            raise ExacqError("recorder_unavailable", "ExacqVision returned an HTTP error.") from None
-        except (urllib.error.URLError, TimeoutError, OSError):
-            raise ExacqError("recorder_unavailable", "The ExacqVision Web Service could not be reached.") from None
+                self._emit_diagnostic(stage, "failed", started, status, "redirect_rejected")
+                raise ExacqError("unsupported_response", "ExacqVision redirected the request; redirects are not followed.", stage=stage, http_status=status) from None
+            self._emit_diagnostic(stage, "failed", started, status, "http_error")
+            raise ExacqError("recorder_unavailable", "ExacqVision returned an HTTP error.", stage=stage, http_status=status) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            category = "timeout" if isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError) else "network_error"
+            self._emit_diagnostic(stage, "failed", started, None, category)
+            raise ExacqError("recorder_unavailable", "The ExacqVision Web Service could not be reached.", stage=stage, transport_category=category) from None
         if len(raw) > MAX_RESPONSE_BYTES:
-            raise ExacqError("response_too_large", "ExacqVision returned an oversized response.")
+            self._emit_diagnostic(stage, "failed", started, status, "response_too_large")
+            raise ExacqError("response_too_large", "ExacqVision returned an oversized response.", stage=stage, http_status=status)
         if expected and mime not in expected:
-            raise ExacqError("unsupported_response", "ExacqVision returned an unexpected response type.")
+            self._emit_diagnostic(stage, "failed", started, status, "unexpected_content_type")
+            raise ExacqError("unsupported_response", "ExacqVision returned an unexpected response type.", stage=stage, http_status=status)
+        self._emit_diagnostic(stage, "succeeded", started, status, None)
         return status, mime, raw
 
     @staticmethod
-    def _json(raw):
+    def _request_stage(path, params):
+        if path == "/login.web": return "authentication"
+        if path in ("/config.web", "/server.web/devices", "/status.web"): return "discovery"
+        if path.startswith("/search.web"): return "search"
+        if path.startswith("/playspeed.web"): return "playback_control"
+        if path.startswith("/step.web"): return "clip_selection"
+        if path == "/timestamp.web": return "timestamp_progression"
+        if path == "/video.web" and (params or {}).get("search_id"): return "recorded_frame_retrieval"
+        if path == "/video.web": return "live_frame_retrieval"
+        return "recorder_request"
+
+    def _emit_diagnostic(self, stage, outcome, started, http_status, error_category):
+        if not self.diagnostic_callback:
+            return
+        try:
+            self.diagnostic_callback(stage, outcome, round((time.monotonic() - started) * 1000), http_status, error_category)
+        except Exception:
+            pass
+
+    def _json(self, raw):
         try:
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ExacqError("malformed_response", "ExacqVision returned an invalid JSON response.") from None
+            raise ExacqError("malformed_response", "ExacqVision returned an invalid JSON response.", stage=getattr(self, "_last_request_stage", "response_validation")) from None
         if not isinstance(value, dict):
-            raise ExacqError("malformed_response", "ExacqVision returned an unexpected JSON shape.")
+            raise ExacqError("malformed_response", "ExacqVision returned an unexpected JSON shape.", stage=getattr(self, "_last_request_stage", "response_validation"))
         return value
 
     def login(self):
@@ -116,10 +152,10 @@ class ExacqClient:
         })
         result = self._json(raw)
         if not result.get("success"):
-            raise ExacqError("permission_denied", "ExacqVision did not accept the configured credentials.")
+            raise ExacqError("permission_denied", "ExacqVision did not accept the configured credentials.", stage="authentication")
         session_id = result.get("sessionId")
         if not isinstance(session_id, str) or not session_id:
-            raise ExacqError("malformed_response", "ExacqVision did not return an authenticated session.")
+            raise ExacqError("malformed_response", "ExacqVision did not return an authenticated session.", stage="authentication")
         self.session_id = session_id
         return result
 
@@ -138,7 +174,7 @@ class ExacqClient:
             _, _, raw = self._request(path, query)
             result = self._json(raw)
             if result.get("success") is False:
-                raise ExacqError("permission_denied", "ExacqVision denied this operation.")
+                raise ExacqError("permission_denied", "ExacqVision denied this operation.", stage=self._request_stage(path, query))
         return result
 
     def discover(self):
@@ -149,7 +185,7 @@ class ExacqClient:
         cameras = config.get("Cameras")
         device_rows = devices.get("devices", [])
         if not isinstance(cameras, list) or not isinstance(device_rows, list):
-            raise ExacqError("malformed_response", "ExacqVision camera inventory has an unexpected shape.")
+            raise ExacqError("malformed_response", "ExacqVision camera inventory has an unexpected shape.", stage="discovery")
         device_by_camera = {}
         for device in device_rows:
             if not isinstance(device, dict):
@@ -202,16 +238,17 @@ class ExacqClient:
                 "-vcodec", "mjpeg", "-i", "pipe:0", "-frames:v", "1", "-f", "null", "-",
             ], input=data, capture_output=True, timeout=15, check=False)
         except FileNotFoundError:
-            raise ExacqError("decoder_unavailable", "FFmpeg is not installed in the monitor container.") from None
+            raise ExacqError("decoder_unavailable", "FFmpeg is not installed in the monitor container.", stage="decoding") from None
         except subprocess.TimeoutExpired:
-            raise ExacqError("timeout", "Video decoding exceeded its time limit.") from None
+            raise ExacqError("timeout", "Video decoding exceeded its time limit.", stage="decoding", transport_category="timeout") from None
         if result.returncode:
-            raise ExacqError("decode_failed", "FFmpeg could not decode a video frame.")
+            raise ExacqError("decode_failed", "FFmpeg could not decode a video frame.", stage="decoding")
 
     def _jpeg(self, path, params):
         _, mime, raw = self._request(path, params)
         if mime != "image/jpeg" or len(raw) < 4 or not raw.startswith(b"\xff\xd8") or not raw.endswith(b"\xff\xd9"):
-            raise ExacqError("video_unavailable", "ExacqVision did not return a valid JPEG frame.")
+            stage = "recorded_frame_retrieval" if (params or {}).get("search_id") else "live_frame_retrieval"
+            raise ExacqError("video_unavailable", "ExacqVision did not return a valid JPEG frame.", stage=stage)
         return raw
 
     def check_live(self, camera_id):
@@ -225,7 +262,7 @@ class ExacqClient:
                 "w": "640", "h": "360", "q": "5", "format": "6", "_cache_bust": str(int(time.time() * 1000)),
             })
             if mime != "image/jpeg" or len(raw) < 4 or not raw.startswith(b"\xff\xd8") or not raw.endswith(b"\xff\xd9"):
-                raise ExacqError("video_unavailable", "ExacqVision did not return a valid JPEG frame.")
+                raise ExacqError("video_unavailable", "ExacqVision did not return a valid JPEG frame.", stage="live_frame_retrieval")
             self._decode_jpeg(raw)
             frames.append(raw)
             if index != 2:
@@ -254,9 +291,9 @@ class ExacqClient:
             if state in (2, "2", "complete", "completed", "done"):
                 return result
             if state in (3, "3", "failed", "error"):
-                raise ExacqError("recording_search_failed", "ExacqVision recording search did not complete.")
+                raise ExacqError("recording_search_failed", "ExacqVision recording search did not complete.", stage="search")
             time.sleep(0.25)
-        raise ExacqError("timeout", "ExacqVision recording search exceeded its time limit.")
+        raise ExacqError("timeout", "ExacqVision recording search exceeded its time limit.", stage="search", transport_category="timeout")
 
     @staticmethod
     def _clips(result):
@@ -293,23 +330,23 @@ class ExacqClient:
                 return 0
         newest = max(clips, key=clip_end) if clips else None
         if newest is None:
-            raise ExacqError("malformed_response", "ExacqVision reported recording frames but no recording interval.")
+            raise ExacqError("malformed_response", "ExacqVision reported recording frames but no recording interval.", stage="clip_selection")
         newest_time = newest.get("endTime") or newest.get("startTime")
         try:
             segment_start = datetime.fromisoformat(newest["startTime"].replace("Z", "+00:00")).timestamp()
             segment_end = datetime.fromisoformat((newest.get("endTime") or newest["startTime"]).replace("Z", "+00:00")).timestamp()
         except (ValueError, AttributeError):
-            raise ExacqError("malformed_response", "ExacqVision returned an invalid recording interval.") from None
+            raise ExacqError("malformed_response", "ExacqVision returned an invalid recording interval.", stage="clip_selection") from None
         segment_start = max(start_dt, segment_start)
         segment_end = min(end_dt.timestamp(), segment_end)
         if segment_end < segment_start:
-            raise ExacqError("malformed_response", "ExacqVision returned a recording outside the requested lookback window.")
+            raise ExacqError("malformed_response", "ExacqVision returned a recording outside the requested lookback window.", stage="clip_selection")
         # Re-run a narrow search inside the newest clip; playback frame 0 is then
         # guaranteed to reference recorded media rather than the broad search's gap.
         sample = self._search(camera_id, iso(segment_start), iso(max(segment_start + 1, segment_end)))
         search_id = sample.get("search_id")
         if not isinstance(search_id, str) or not search_id:
-            raise ExacqError("malformed_response", "ExacqVision did not return a playback search handle.")
+            raise ExacqError("malformed_response", "ExacqVision did not return a playback search handle.", stage="clip_selection")
         stream_id = str(uuid.uuid4())
         timestamps = []
         try:
@@ -335,9 +372,10 @@ class ExacqClient:
                 if index < 4:
                     time.sleep(0.6)
             if len(set(timestamps)) < 2:
-                raise ExacqError("playback_not_advancing", "Recorded frames decoded, but the playback timestamp did not advance.")
+                raise ExacqError("playback_not_advancing", "Recorded frames decoded, but the playback timestamp did not advance.", stage="timestamp_progression")
         except ExacqError as error:
-            raise ExacqError(error.code, error.safe_message, search_verified=True) from None
+            raise ExacqError(error.code, error.safe_message, search_verified=True, stage=error.stage,
+                             http_status=error.http_status, transport_category=error.transport_category) from None
         finally:
             try:
                 self._request("/playspeed.web/0", {"search_id": search_id})
