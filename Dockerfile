@@ -13,6 +13,7 @@ RUN apt-get update \
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py ./app.py
+COPY exacq.py ./exacq.py
 COPY oidc.py ./oidc.py
 COPY branding.py ./branding.py
 COPY scheduler.py ./scheduler.py

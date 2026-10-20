@@ -2,7 +2,7 @@
 
 Camera Health Monitor is a browser-managed service for checking ExacqVision camera live video and motion recordings. It is designed to run in Docker on a VM that can reach the recorder and camera network.
 
-> **Integration status:** Server configuration and persistent camera inventory are available. Installed-server Exacq compatibility is not verified. Discovery, live delivery/decoding, recording search, and recorded playback must be validated independently against the actual ExacqVision deployment. The current fixture does not verify stale/replayed sample detection; that behavior also requires validation against the installed interface where its evidence permits. No untested capability is reported as healthy.
+> **Integration status:** The ExacqVision Web Client interface has been implemented from sanitized captures of ExacqVision Server 21.12.8 and Web Service 21.12.1. Automated tests use synthetic responses. Validate authentication and playback against your recorder after deployment; live capture timestamps are not supplied by the observed JPEG endpoint, so freshness is explicitly reported as unverified.
 
 ## Requirements
 
@@ -105,9 +105,9 @@ The browser calls the same versioned REST API intended for automation clients. O
 | `GET` / `POST` | `/api/v1/servers/{server_id}/capabilities` | Operator read / administrator probe | Read or probe independent capabilities |
 | `GET` | `/api/v1/cameras` | Operator or administrator | List persistent inventory |
 | `PUT` | `/api/v1/cameras/{camera_id}` | Administrator | Update per-camera overrides |
-| `POST` | `/api/v1/cameras/{camera_id}/live-check` | Operator or administrator; `checks:run` for tokens | Start asynchronous live sample check (`202` with job ID; `501` for unverified Exacq) |
+| `POST` | `/api/v1/cameras/{camera_id}/live-check` | Operator or administrator; `checks:run` for tokens | Start asynchronous live sample check (`202` with job ID; `502` for recorder or media failures) |
 | `GET` / `DELETE` | `/api/v1/live-checks/{job_id}` | Operator or administrator; `health:read` to poll, `checks:run` to cancel | Poll a check result or cancel an active check |
-| `POST` | `/api/v1/cameras/{camera_id}/recording-check` | Operator or administrator; `checks:run` for tokens | Start recording search and decode (`202` with job ID; `501` for unverified Exacq) |
+| `POST` | `/api/v1/cameras/{camera_id}/recording-check` | Operator or administrator; `checks:run` for tokens | Start recording search and decode (`202` with job ID; `502` for recorder or media failures) |
 | `POST` | `/api/v1/servers/{server_id}/recording-check` | Operator or administrator; `checks:run` for tokens | Start a recording check for each present camera |
 | `GET` | `/api/v1/recording-checks/{job_id}` | Operator or administrator; `health:read` for tokens | Poll recording-check job and sanitized result |
 | `GET` | `/api/v1/branding` | Public | Read shared appearance settings for sign-in and application pages |
@@ -190,9 +190,20 @@ The SSO label and logo are saved and displayed as branding data. The SSO sign-in
 
 The VM needs DNS and network routes/firewall rules to each recorder and any separately configured RTSP server. No recorder API port is assumed by the form; specify a port only after confirming it for the installed interface. Exacq public material identifies CLI/SDK/Web Services Integration tools and describes Web Service as an interface for video/server data. The SDK/OEM path is gated by the Connected Partner Program. Public documentation does not establish the installed server's authentication method, exposed API operations, enabled services, permissions, platform, or licensing.
 
-Before enabling real integration, record the installed ExacqVision version, server platform and licensing, Web Service/API enablement and contract, supported authentication method, least-privilege account permissions, network paths and ports, and optional RTSP configuration. RTSP is separately configured and optional (vendor documentation describes port 8554 as its default); it is not implied by enabling Web Service. Confirm camera discovery, fresh live sample retrieval plus decoding, recording search, and newest recorded sample retrieval plus decoding independently. This configuration slice stores credentials but does not authenticate to the recorder.
+Configure the Web Service host, scheme, and port independently of the optional native recorder port. The captured target uses HTTP on port 80; HTTPS is supported and recommended where enabled. Exacq credentials are encrypted at rest and exchanged only when the monitor makes a request. The application does not persist Exacq session IDs; each job authenticates, uses its short-lived session, and discards it after the operation. Redirects are rejected so credentials cannot be forwarded to a different origin.
 
-Until the installed contract is validated, Exacq discovery remains `untested`; manual discovery returns `501 integration_unverified` with actionable prerequisites. Live delivery, recording search, and recorded playback remain independently `untested`. Requests to start a live check on an Exacq camera return `501 integration_unverified`; no recorder request is attempted. Fixture success is not evidence of Exacq compatibility.
+The adapter is isolated in `exacq.py` and follows the version-specific Web Client routes observed in the captures:
+
+- Authentication: `POST /login.web` using the Web Client credential form.
+- Discovery: `GET /config.web` and `/server.web/devices`, with `/status.web` for recorder state.
+- Live: repeated `GET /video.web` JPEG samples, decoded individually by FFmpeg.
+- Recording: `GET /search.web`, bounded polling of `/search.web/status`, and recorded frame retrieval using `/playspeed.web`, `/step.web`, `/video.web`, and `/timestamp.web`.
+
+Discovery preserves stable application camera IDs across refreshes and stores the Exacq remote ID, parent association, enabled/connection state, and available device metadata. Cameras that Exacq marks disabled are visible and excluded from scheduled checks. A device's disconnected state is shown as a dashboard warning; it becomes a camera incident only when a confirmed live retrieval or decode check fails. Auxiliary devices without a camera association are ignored.
+
+A live success means three live-endpoint JPEG frames were retrieved and decoded. The captured service does not provide a source capture timestamp, so the result reports `freshness_verified: false` and does not claim wall-clock freshness. Recording checks search the configured rolling lookback, select the newest interval, narrow the search to that clip, retrieve a recorded sample, and decode it. No media, thumbnails, session IDs, or Exacq response bodies are retained. Use the **Test connection** action, refresh inventory, then run one live and one recording check to validate the installed account's permissions and playback behavior.
+
+These routes are undocumented Web Client behavior and may vary by Exacq release. In particular, test the ordinary username/password login path, session behavior, JPEG live retrieval, search completion status values, and recorded-frame selection against the installed service. The adapter limits request/decoder time, rejects malformed or oversized responses, and reports authentication, transport, timeout, unsupported media, and decode failures separately. Failed discovery preserves the last known inventory rather than marking every camera missing.
 
 Live checks run asynchronously and return a pollable job (`queued`, `running`, `succeeded`, `failed`, or `cancelled`). The service limits active live and recording work separately with `CHM_LIVE_CHECK_CONCURRENCY` (default 4, maximum 8), prevents overlapping check types for one camera, and bounds FFmpeg decoding with `CHM_LIVE_CHECK_TIMEOUT_SECONDS` (default 15, maximum 60). FFmpeg reads a temporary sample file that is removed after success, failure, timeout, or cancellation. A successful result confirms that FFmpeg decoded at least one video frame. `sample_timestamp` is null when the source supplies no capture timestamp; a container presentation timestamp is not treated as wall-clock capture evidence. Job outcomes are held in memory for up to 24 hours and are lost if the service restarts; persisted current health, last success, and next schedule time remain available.
 
@@ -208,7 +219,7 @@ An administrator may configure an optional external heartbeat in **Webhooks** or
 
 For acceptance tests, `CHM_TEST_CLOCK_FILE` may point to a file containing an epoch timestamp. The scheduler reads that clock for due-time and confirmation decisions; leave this unset in normal deployments.
 
-Recording checks use the persisted server `recording_lookback_hours` default (24 hours) unless a camera override is configured (1–720 hours). The time window includes its exact lower boundary. A check searches that rolling window, selects the newest matching recording by timestamp, retrieves a small sample, and requires FFmpeg to decode a frame. `recording_status.health` is independent of live status: `healthy` means a sample decoded; `warning` with reason `no_recent_recording` means the window had no motion footage; `failure` with reason `decode_failed` means a matching newest recording existed but was unreadable; connector, unsupported, timeout, and permission problems are `unknown` and do not claim a camera fault. Results retain check time, the most recent successful recording-check time, newest recording time, and sanitized evidence without retaining media. Recording jobs are in-memory for polling and are lost on restart, while the latest per-camera outcome persists. The server-level action returns one job per present camera; poll each job ID for completion.
+Recording checks use the persisted server `recording_lookback_hours` default (24 hours) unless a camera override is configured (1–720 hours). `recording_expected` defaults to true and can be set per camera to false when motion recordings are not expected; the no-recording result remains visible without opening an incident or sending a missing-recording alert. The time window includes its exact lower boundary. A check searches that rolling window, selects the newest matching recording by timestamp, retrieves a small sample, and requires FFmpeg to decode a frame. `recording_status.health` is independent of live status: `healthy` means a sample decoded; `warning` with reason `no_recent_recording` means the window had no motion footage; `failure` with reason `decode_failed` means a matching newest recording existed but was unreadable; connector, unsupported, timeout, and permission problems are `unknown` and do not claim a camera fault. Results retain check time, the most recent successful recording-check time, newest recording time, and sanitized evidence without retaining media. Recording jobs are in-memory for polling and are lost on restart, while the latest per-camera outcome persists. The server-level action returns one job per present camera; poll each job ID for completion.
 
 ### Incidents and recovery
 
@@ -218,7 +229,7 @@ An initial live decode failure waits for the configured second attempt after 30 
 
 Incidents and transitions are stored in SQLite and survive container replacement. Resolved incident history is retained for 90 days by default; active incidents and pending outbox events are not pruned. The `event_outbox` table is the durable handoff seam for webhook delivery work; each incident open/update/recovery has a stable event ID and redacted JSON payload. This incident slice records pending events; delivery and retry are handled by webhook delivery support. No video or thumbnails are stored in incidents. The browser dashboard uses these same versioned API routes for active incidents, details, acknowledgments, and 90-day history.
 
-Fixture-only recording profiles include `recording_success`, `recording_none`, `recording_invalid_media`, `recording_permission_error`, `recording_search_error`, and `recording_boundary`. They exercise the same public API and use the bundled real MP4 or intentionally malformed bytes through FFmpeg. These profiles validate app behavior only; they do not establish an Exacq search or playback contract. The installed server's recording search, authorization, and recorded-playback method remain unverified, so real Exacq recording checks return `501 integration_unverified` without contacting it until validated.
+Fixture-only profiles include `recording_success`, `recording_none`, `recording_invalid_media`, `recording_permission_error`, `recording_search_error`, and `recording_boundary`. They exercise application behavior with synthetic metadata and a bundled MP4 or intentionally malformed bytes. They are not evidence of Exacq compatibility.
 
 ### Webhooks and downstream automation
 
@@ -281,7 +292,7 @@ The API acceptance suite launches the app as a separate process with temporary p
 python -m unittest discover -s tests -v
 ```
 
-The real-browser acceptance flow is in `tests/test_browser_acceptance.py`. To run it, install Playwright and its Chromium browser, then run the same unittest command. It covers first-run setup, recorder configuration and unverified capability display, dashboard rendering, sign-out, and sign-in through the browser.
+The real-browser acceptance flow is in `tests/test_browser_acceptance.py`. To run it, install Playwright and its Chromium browser, then run the same unittest command. It covers first-run setup, recorder configuration and capability display, dashboard rendering, sign-out, and sign-in through the browser.
 
 
 ## OpenID Connect provider setup and role mappings
